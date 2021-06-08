@@ -3,7 +3,7 @@
 #![warn(missing_debug_implementations)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::clippy::module_name_repetitions)]
-mod command;
+mod image;
 mod request;
 #[macro_use]
 mod utils;
@@ -12,10 +12,14 @@ mod scsi;
 
 use std::{
     convert::TryInto,
-    sync::{Arc, RwLock},
+    fs::File,
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
 };
 
+use image::Image;
 use request::VirtioScsiLun;
+use structopt::StructOpt;
 use vhost::vhost_user::{
     message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
     Listener,
@@ -35,11 +39,15 @@ const SENSE_SIZE: usize = 96; // TODO: default; can change
 
 struct VhostUserScsiBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    image: Mutex<Image>,
 }
 
 impl VhostUserScsiBackend {
-    const fn new() -> Self {
-        Self { mem: None }
+    fn new(image: Image) -> Self {
+        Self {
+            mem: None,
+            image: Mutex::new(image),
+        }
     }
 }
 
@@ -54,6 +62,7 @@ fn handle_control_queue(
 fn handle_request_queue(
     buf: &[u8],
     writer: &mut DescriptorChainWriter<impl GuestAddressSpace + Clone>,
+    image: &mut Image,
 ) {
     // unwrap is safe unless it's too short - we just sliced 8 out
     // TODO: but it does panic if it's too short
@@ -76,14 +85,17 @@ fn handle_request_queue(
 
     let response = if lun == VirtioScsiLun::TargetLun(0, 0) {
         let output = scsi::execute_command(
-            lun,
-            id,
-            cdb,
-            task_attr,
-            &mut body_writer,
-            &mut DescriptorChainReader,
-            crn,
-            prio,
+            scsi::Request {
+                lun,
+                id,
+                cdb,
+                task_attr,
+                data_in: &mut body_writer,
+                data_out: &mut DescriptorChainReader,
+                crn,
+                prio,
+            },
+            image,
         );
 
         println!("Command result: {:?}", output.status);
@@ -186,7 +198,10 @@ impl VhostUserBackend for VhostUserScsiBackend {
             let mut writer = DescriptorChainWriter::new(dc.clone());
             match device_event {
                 0 => handle_control_queue(&s, &mut writer),
-                2 => handle_request_queue(&s, &mut writer),
+                2 => {
+                    let mut img = self.image.lock().unwrap();
+                    handle_request_queue(&s, &mut writer, &mut *img)
+                }
                 _ => todo!(),
             }
 
@@ -237,19 +252,31 @@ impl VhostUserBackend for VhostUserScsiBackend {
     // }
 }
 
+#[derive(StructOpt, Debug)]
+struct Opt {
+    #[structopt(parse(from_os_str))]
+    sock: PathBuf,
+    #[structopt(parse(from_os_str))]
+    image: PathBuf,
+}
+
 fn main() {
     env_logger::init();
 
+    let opt = Opt::from_args();
+
+    let img = Image::new(&opt.image).expect("opening image");
+
     let mut daemon = VhostUserDaemon::new(
         "vhost-user-scsi".into(),
-        Arc::new(RwLock::new(VhostUserScsiBackend::new())),
+        Arc::new(RwLock::new(VhostUserScsiBackend::new(img))),
     )
     .expect("Creating daemon");
 
     dbg!();
 
     daemon
-        .start(Listener::new("/tmp/vhost-user-scsi.sock", true).expect("listener"))
+        .start(Listener::new(opt.sock, true).expect("listener"))
         .expect("starting daemon");
 
     dbg!();

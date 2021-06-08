@@ -135,6 +135,13 @@ pub enum Command {
         mode_page: ModePageSelection,
         dbd: bool,
     },
+    Read10 {
+        dpo: bool,
+        fua: bool,
+        lba: u32,
+        group_number: u8,
+        transfer_length: u16,
+    },
     Inquiry(Option<InquiryPageCode>),
     ReportSupportedOperationCodes {
         rctd: bool,
@@ -148,6 +155,7 @@ pub enum CommandType {
     ReportLuns,
     ReadCapacity16,
     ModeSense6,
+    Read10,
     Inquiry,
     ReportSupportedOperationCodes,
 }
@@ -156,6 +164,7 @@ const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
     (CommandType::TestUnitReady, (0x0, None)),
     (CommandType::Inquiry, (0x12, None)),
     (CommandType::ModeSense6, (0x1a, None)),
+    (CommandType::Read10, (0x28, None)),
     (CommandType::ReadCapacity16, (0x9e, Some(0x10))),
     (CommandType::ReportLuns, (0xa0, None)),
     (
@@ -187,6 +196,8 @@ impl CommandType {
             })
     }
     fn from_cdb(cdb: &[u8]) -> Result<Self, ParseError> {
+        // TODO: Variable-length CDBs put the service action in a different
+        // place. This'll need to change if we ever support those.
         Self::from_opcode_and_sa(cdb[0], u16::from(cdb[1] & 0b0001_1111)).map_err(|e| {
             dbg!(cdb);
             e
@@ -244,6 +255,18 @@ impl CommandType {
                 0x1a,
                 0b0000_1000,
                 0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b0000_0100,
+            ],
+            CommandType::Read10 => &[
+                0x28,
+                0b1111_1100,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b0011_1111,
                 0b1111_1111,
                 0b1111_1111,
                 0b0000_0100,
@@ -335,7 +358,6 @@ impl Cdb {
                 })
             }
             CommandType::ModeSense6 => {
-                // MODE SENSE(6)
                 let dbd = match buf[1] {
                     0b0000_1000 => true,
                     0b0000_0000 => false,
@@ -360,6 +382,25 @@ impl Cdb {
                     },
                     allocation_length: Some(u32::from(buf[4])),
                     naca: (buf[5] & 0b0000_0100) != 0,
+                })
+            }
+            CommandType::Read10 => {
+                if buf[1] & 0b1110_0100 != 0 {
+                    // Features (protection and rebuild assist) we don't
+                    // support; the standard says to respond with INVALID
+                    // FIELD IN CDB for these if unsupported
+                    return Err(ParseError::InvalidField);
+                }
+                Ok(Self {
+                    command: Command::Read10 {
+                        dpo: buf[1] & 0b0001_0000 != 0,
+                        fua: buf[1] & 0b0000_1000 != 0,
+                        lba: u32::from_be_bytes(buf[2..6].try_into().unwrap()),
+                        group_number: buf[6] & 0b0011_1111,
+                        transfer_length: u16::from_be_bytes(buf[7..9].try_into().unwrap()),
+                    },
+                    allocation_length: None,
+                    naca: (buf[15] & 0b0000_0100) != 0,
                 })
             }
             CommandType::ReadCapacity16 => {

@@ -7,8 +7,8 @@ use std::io::Read;
 use std::io::Write;
 use std::rc::Rc;
 
-use crate::command::Cdb;
 use crate::hope;
+use crate::scsi::command::Cdb;
 use vm_memory::Bytes;
 use vm_memory::GuestAddress;
 use vm_memory::GuestAddressSpace;
@@ -127,7 +127,7 @@ impl<M: GuestAddressSpace + Clone> DescriptorChainWriter<M> {
             current,
             offset: 0,
             written: 0,
-            max_written: Default::default(),
+            max_written: Rc::new(Cell::new(0)),
         }
     }
 
@@ -171,7 +171,7 @@ impl<M: GuestAddressSpace + Clone> DescriptorChainWriter<M> {
 
 impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // dbg!(self.current, self.offset, buf);
+        // dbg!(self.current, self.offset, buf.len());
         if let Some(current) = self.current {
             let left_in_descriptor = current.len() - self.offset;
             let to_write: u32 = min(left_in_descriptor, buf.len() as u32);
@@ -185,10 +185,13 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
                 )
                 .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
 
+            // dbg!(to_write, written);
+
             self.offset += written as u32;
 
             if self.offset == current.len() {
-                self.current = self.iter.next()
+                self.current = self.iter.next();
+                self.offset = 0;
             }
 
             self.add_written(written as u32);

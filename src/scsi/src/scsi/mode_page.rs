@@ -6,7 +6,7 @@ pub enum ModePage {
 }
 
 impl ModePage {
-    pub const ALL_ZERO: &'static [ModePage] = &[ModePage::Caching];
+    pub const ALL_ZERO: &'static [Self] = &[Self::Caching];
     pub const fn page_code(self) -> (u8, u8) {
         match self {
             Self::Caching => (0x8, 0),
@@ -38,7 +38,7 @@ impl ModePage {
                     ])
                     .unwrap();
                 // various cache fine-tuning stuff we can't really control
-                data_in.write_all(&[0; 0x11]);
+                data_in.write_all(&[0; 0x11]).unwrap();
             }
         }
     }

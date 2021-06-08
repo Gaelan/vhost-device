@@ -1,3 +1,4 @@
+pub mod command;
 pub mod mode_page;
 mod sense;
 
@@ -5,14 +6,13 @@ use std::cmp::min;
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 
-use crate::command::CommandType;
-use crate::command::ModePageSelection;
-use crate::command::ModeSensePageControl;
-use crate::command::ParseError;
-use crate::command::ReportSupportedOpCodesMode;
 use crate::{
-    command::{Cdb, Command, ReportLunsSelectReport},
+    image::Image,
     request::VirtioScsiLun,
+    scsi::command::{
+        Cdb, Command, CommandType, InquiryPageCode, ModePageSelection, ModeSensePageControl,
+        ParseError, ReportLunsSelectReport, ReportSupportedOpCodesMode,
+    },
     scsi::mode_page::ModePage,
 };
 
@@ -72,6 +72,7 @@ impl<W: Write> Write for SilentlyTruncate<W> {
 }
 
 #[repr(u8)] // actually 5 bits
+#[allow(dead_code)]
 enum DeviceType {
     DirectAccessBlock = 0x0,
     SequentialAccess = 0x1,
@@ -86,26 +87,28 @@ enum DeviceType {
     ObjectBasedStorage = 0x11,
 }
 
+pub struct Request<'a, W: Write, R: Read> {
+    pub lun: VirtioScsiLun,
+    pub id: u64,
+    pub cdb: &'a [u8],
+    pub task_attr: TaskAttr,
+    pub data_in: &'a mut W,
+    pub data_out: &'a mut R,
+    pub crn: u8,
+    pub prio: u8,
+}
+
 // TODO: would this be more readable split into functions? I lean towards
 // thinking it just adds boilderplate, but not sure
 #[allow(clippy::too_many_lines)]
-pub fn execute_command(
-    lun: VirtioScsiLun,
-    id: u64,
-    cdb: &[u8],
-    task_attr: TaskAttr,
-    data_in: &mut impl Write,
-    data_out: &mut impl Read,
-    crn: u8,
-    prio: u8,
-) -> CmdOutput {
+pub fn execute_command(req: Request<'_, impl Write, impl Read>, image: &mut Image) -> CmdOutput {
     // dbg!(lun, id, task_attr, crn, prio);
-    hope!(lun == VirtioScsiLun::TargetLun(0, 0));
-    hope!(crn == 0);
-    hope!(task_attr == TaskAttr::Simple);
-    hope!(prio == 0);
+    hope!(req.lun == VirtioScsiLun::TargetLun(0, 0));
+    hope!(req.crn == 0);
+    hope!(req.task_attr == TaskAttr::Simple);
+    hope!(req.prio == 0);
 
-    let cdb = match Cdb::parse(cdb) {
+    let cdb = match Cdb::parse(req.cdb) {
         Ok(cdb) => cdb,
         Err(ParseError::InvalidCommand) => {
             return CmdOutput::check_condition(sense::INVALID_COMMAND_OPERATION_CODE)
@@ -121,7 +124,7 @@ pub fn execute_command(
     hope!(!cdb.naca);
 
     let mut data_in = SilentlyTruncate(
-        data_in,
+        req.data_in,
         cdb.allocation_length.map_or(usize::MAX, |x| x as usize),
     );
 
@@ -144,13 +147,12 @@ pub fn execute_command(
             CmdOutput::ok()
         }
         Command::ReadCapacity16 => {
-            // 1 GB (I hope) in 4096-byte blocks
-            // TODO: trying 4096 logical/physical for now. May need to fall
-            // back to 512 logical/4096 physical for back compat.
+            let final_block: u64 = image.size_in_blocks() - 1;
+            let block_size: u32 = image.block_size();
 
             // n.b. this is the last block, ie (length-1), not length
-            data_in.write_all(&0x3_ffff_u64.to_be_bytes()).unwrap();
-            data_in.write_all(&4096_u32.to_be_bytes()).unwrap();
+            data_in.write_all(&final_block.to_be_bytes()).unwrap();
+            data_in.write_all(&block_size.to_be_bytes()).unwrap();
             // no protection stuff; 1-to-1 logical/physical blocks
             data_in.write_all(&[0, 0]).unwrap();
 
@@ -204,6 +206,25 @@ pub fn execute_command(
 
             CmdOutput::ok()
         }
+        Command::Read10 {
+            dpo,
+            fua,
+            lba,
+            group_number,
+            transfer_length,
+        } => {
+            hope!(dpo == false);
+            hope!(fua == false);
+            hope!(group_number == 0);
+
+            let bytes = image
+                .read_blocks(lba as u64, transfer_length as u64)
+                .unwrap();
+
+            data_in.write_all(&bytes[..]).unwrap();
+
+            CmdOutput::ok()
+        }
         Command::Inquiry(page_code) => {
             // TODO: we should also be responding to INQUIRies to bad LUNs, but
             // right now we terminate those before here
@@ -216,7 +237,7 @@ pub fn execute_command(
             if let Some(code) = page_code {
                 let mut out = vec![];
                 match code {
-                    crate::command::InquiryPageCode::SupportedVpdPages => {
+                    InquiryPageCode::SupportedVpdPages => {
                         // TODO: do we want to support other pages?
                         out.push(0);
                     }

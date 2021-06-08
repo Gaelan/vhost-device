@@ -7,7 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-vhost-user-backend = { path = "../vhost-user-backend" }
+vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend" }
 epoll = "4.3.1"
 vm-memory = "0.5.0"
 vhost = { git = "https://github.com/rust-vmm/vhost" }
@@ -18,8 +18,3 @@ vm-virtio = { git = "https://github.com/rust-vmm/vm-virtio" }
 vmm-sys-util = "0.8.0"
 structopt = "0.3"
 
-[patch."https://github.com/rust-vmm/vm-virtio"]
-vm-virtio = { path = "../vm-virtio" }
-
-[patch."https://github.com/rust-vmm/vhost"]
-vhost = { path = "../vhost" }
