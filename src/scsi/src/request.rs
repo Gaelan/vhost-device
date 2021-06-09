@@ -53,6 +53,7 @@ pub struct Request {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum VirtioScsiResponse {
     Ok = 0,
     Overrun = 1,
@@ -142,10 +143,6 @@ impl<M: GuestAddressSpace + Clone> DescriptorChainWriter<M> {
             self.offset -= current.len();
             self.current = self.iter.next();
         }
-    }
-
-    pub fn done(&self) -> bool {
-        self.current.is_none()
     }
 
     pub fn residual(&mut self) -> u32 {

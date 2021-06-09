@@ -12,7 +12,6 @@ mod scsi;
 
 use std::{
     convert::TryInto,
-    fs::File,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
 };

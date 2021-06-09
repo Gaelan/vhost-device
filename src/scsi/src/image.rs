@@ -37,7 +37,7 @@ impl Image {
         len / u64::from(self.block_size)
     }
 
-    pub fn block_size(&self) -> u32 {
+    pub const fn block_size(&self) -> u32 {
         self.block_size
     }
 }

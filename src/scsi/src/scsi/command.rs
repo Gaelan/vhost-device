@@ -324,6 +324,9 @@ impl Cdb {
     // TODO: do we want to ensure reserved fields are 0? SCSI allows, but
     // doesn't require, us to do so.
     // #[deny(clippy::clippy::indexing_slicing)]
+    // See comment in mod.rs - I don't think we gain anything splitting this
+    // into functions
+    #[allow(clippy::clippy::too_many_lines)]
     pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
         let ct = CommandType::from_cdb(buf)?;
         match ct {

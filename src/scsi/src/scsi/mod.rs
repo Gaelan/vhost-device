@@ -213,12 +213,12 @@ pub fn execute_command(req: Request<'_, impl Write, impl Read>, image: &mut Imag
             group_number,
             transfer_length,
         } => {
-            hope!(dpo == false);
-            hope!(fua == false);
+            hope!(!dpo);
+            hope!(!fua);
             hope!(group_number == 0);
 
             let bytes = image
-                .read_blocks(lba as u64, transfer_length as u64)
+                .read_blocks(u64::from(lba), u64::from(transfer_length))
                 .unwrap();
 
             data_in.write_all(&bytes[..]).unwrap();
@@ -270,7 +270,7 @@ pub fn execute_command(req: Request<'_, impl Write, impl Read>, image: &mut Imag
                 // no idea if anyone else does.
                 data_in.write_all(&[0; 22]).unwrap();
 
-                // are we getting these right? does anyone care?
+                // TODO: are we getting these right? does anyone care?
                 let product_descs: &[u16; 8] = &[0xc0, 0x05c0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
 
                 for desc in product_descs {
