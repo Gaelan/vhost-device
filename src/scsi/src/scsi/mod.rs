@@ -2,6 +2,7 @@ pub mod block_device;
 pub mod command;
 pub mod mode_page;
 mod sense;
+mod tests;
 
 use std::{
     cmp::min,
@@ -19,7 +20,7 @@ pub enum TaskAttr {
     Aca,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CmdOutput {
     pub status: u8,
     pub status_qualifier: u16,
