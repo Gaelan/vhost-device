@@ -1,19 +1,12 @@
+pub mod block_device;
 pub mod command;
 pub mod mode_page;
 mod sense;
 
-use std::cmp::min;
-use std::convert::TryFrom;
-use std::io::{Read, Write};
-
-use crate::{
-    image::Image,
-    request::VirtioScsiLun,
-    scsi::command::{
-        Cdb, Command, CommandType, InquiryPageCode, ModePageSelection, ModeSensePageControl,
-        ParseError, ReportLunsSelectReport, ReportSupportedOpCodesMode,
-    },
-    scsi::mode_page::ModePage,
+use std::{
+    cmp::min,
+    convert::TryFrom,
+    io::{Read, Write},
 };
 
 use self::sense::SenseTriple;
@@ -88,7 +81,6 @@ enum DeviceType {
 }
 
 pub struct Request<'a, W: Write, R: Read> {
-    pub lun: VirtioScsiLun,
     pub id: u64,
     pub cdb: &'a [u8],
     pub task_attr: TaskAttr,
@@ -98,217 +90,50 @@ pub struct Request<'a, W: Write, R: Read> {
     pub prio: u8,
 }
 
-// TODO: would this be more readable split into functions? I lean towards
-// thinking it just adds boilderplate, but not sure
-#[allow(clippy::too_many_lines)]
-pub fn execute_command(req: Request<'_, impl Write, impl Read>, image: &mut Image) -> CmdOutput {
-    // dbg!(lun, id, task_attr, crn, prio);
-    hope!(req.lun == VirtioScsiLun::TargetLun(0, 0));
-    hope!(req.crn == 0);
-    hope!(req.task_attr == TaskAttr::Simple);
-    hope!(req.prio == 0);
+pub trait Target<W: Write, R: Read>: Send + Sync {
+    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> CmdOutput;
+}
 
-    let cdb = match Cdb::parse(req.cdb) {
-        Ok(cdb) => cdb,
-        Err(ParseError::InvalidCommand) => {
-            return CmdOutput::check_condition(sense::INVALID_COMMAND_OPERATION_CODE)
-        }
-        // TODO: SCSI has a provision for INVALID FIELD IN CDB to include the
-        // index of the invalid field, but it's not clear if that's mandatory.
-        // In any case, QEMU omits it.
-        Err(ParseError::InvalidField) => {
-            return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB)
-        }
-    };
+pub trait LogicalUnit<W: Write, R: Read>: Send + Sync {
+    fn execute_command(&self, req: Request<'_, W, R>, target: &EmulatedTarget<W, R>) -> CmdOutput;
+}
 
-    hope!(!cdb.naca);
+struct MissingLun;
 
-    let mut data_in = SilentlyTruncate(
-        req.data_in,
-        cdb.allocation_length.map_or(usize::MAX, |x| x as usize),
-    );
+impl<W: Write, R: Read> LogicalUnit<W, R> for MissingLun {
+    fn execute_command(&self, _: Request<'_, W, R>, target: &EmulatedTarget<W, R>) -> CmdOutput {
+        todo!()
+    }
+}
 
-    println!("Incoming command: {:?}", &cdb);
+pub struct EmulatedTarget<W: Write, R: Read> {
+    luns: Vec<Box<dyn LogicalUnit<W, R>>>,
+}
 
-    match cdb.command {
-        Command::TestUnitReady => CmdOutput::ok(),
-        Command::ReportLuns(select_report) => {
-            // TODO: actually understand the LUN format
-            let luns: Vec<[u8; 8]> = vec![[0, 0, 0, 0, 0, 0, 0, 0]];
+impl<W: Write, R: Read> EmulatedTarget<W, R> {
+    pub fn new() -> Self {
+        Self { luns: Vec::new() }
+    }
 
-            hope!(select_report == ReportLunsSelectReport::NoWellKnown);
+    pub fn add_lun(&mut self, logical_unit: Box<dyn LogicalUnit<W, R>>) {
+        self.luns.push(logical_unit)
+    }
 
-            data_in.write_all(&8_u32.to_be_bytes()).unwrap();
-            data_in.write_all(&[0; 4]).unwrap();
-            for lun in luns {
-                data_in.write_all(&lun).unwrap();
-            }
+    pub fn luns(&self) -> impl Iterator<Item = u16> + ExactSizeIterator + '_ {
+        self.luns
+            .iter()
+            .enumerate()
+            .map(|(idx, lun)| u16::try_from(idx).unwrap())
+    }
+}
 
-            CmdOutput::ok()
-        }
-        Command::ReadCapacity16 => {
-            let final_block: u64 = image.size_in_blocks() - 1;
-            let block_size: u32 = image.block_size();
+impl<W: Write, R: Read> Target<W, R> for EmulatedTarget<W, R> {
+    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> CmdOutput {
+        let lun: &dyn LogicalUnit<W, R> = self
+            .luns
+            .get(lun as usize)
+            .map_or(&MissingLun, |x| x.as_ref());
 
-            // n.b. this is the last block, ie (length-1), not length
-            data_in.write_all(&final_block.to_be_bytes()).unwrap();
-            data_in.write_all(&block_size.to_be_bytes()).unwrap();
-            // no protection stuff; 1-to-1 logical/physical blocks
-            data_in.write_all(&[0, 0]).unwrap();
-
-            // top 2 bits: thin provisioning stuff; other 14 bits are lowest
-            // aligned LBA
-            data_in.write_all(&[0b1100_0000, 0]).unwrap();
-
-            // reserved
-            data_in.write_all(&[0; 16]).unwrap();
-
-            CmdOutput::ok()
-        }
-        Command::ModeSense6 { mode_page, pc, dbd } => {
-            hope!(pc == ModeSensePageControl::Current);
-            hope!(!dbd);
-
-            let single_page_array: [ModePage; 1];
-
-            let pages = match mode_page {
-                ModePageSelection::Single(x) => {
-                    single_page_array = [x];
-                    &single_page_array
-                }
-                ModePageSelection::AllPageZeros => ModePage::ALL_ZERO,
-            };
-
-            let pages_len: u32 = pages.iter().map(|x| u32::from(x.page_length() + 2)).sum();
-            let pages_len = u8::try_from(pages_len).unwrap();
-
-            // mode parameter header
-            data_in
-                .write_all(&[
-                    pages_len + 3, // size in bytes after this one
-                    0,             // medium type - 0 for SBC
-                    0b1000_0000,   // write protected, no DPOFUA support
-                    0,             // block desc length
-                ])
-                .unwrap();
-
-            // TODO: block descriptors are optional. does anyone care?
-
-            // // block descriptos
-            // // TODO: dynamic size
-            // data_in.write_all(&0x1_0000_u32.to_be_bytes()).unwrap();
-            // // top byte reserved
-            // data_in.write_all(&512_u32.to_be_bytes()).unwrap();
-
-            for page in pages {
-                page.write(&mut data_in);
-            }
-
-            CmdOutput::ok()
-        }
-        Command::Read10 {
-            dpo,
-            fua,
-            lba,
-            group_number,
-            transfer_length,
-        } => {
-            hope!(!dpo);
-            hope!(!fua);
-            hope!(group_number == 0);
-
-            let bytes = image
-                .read_blocks(u64::from(lba), u64::from(transfer_length))
-                .unwrap();
-
-            data_in.write_all(&bytes[..]).unwrap();
-
-            CmdOutput::ok()
-        }
-        Command::Inquiry(page_code) => {
-            // TODO: we should also be responding to INQUIRies to bad LUNs, but
-            // right now we terminate those before here
-
-            // top bits 0: peripheral device code = exists and ready
-            data_in
-                .write_all(&[DeviceType::DirectAccessBlock as u8])
-                .unwrap();
-
-            if let Some(code) = page_code {
-                let mut out = vec![];
-                match code {
-                    InquiryPageCode::SupportedVpdPages => {
-                        // TODO: do we want to support other pages?
-                        out.push(0);
-                    }
-                    _ => return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB),
-                }
-                data_in.write_all(&[code.into()]).unwrap();
-                data_in
-                    .write_all(&u16::try_from(out.len()).unwrap().to_be_bytes())
-                    .unwrap();
-                data_in.write_all(&out).unwrap();
-            } else {
-                data_in
-                    .write_all(&[
-                        0,   // various bits: not removable, not part of a conglomerate, no info on hotpluggability
-                        0x7, // version: SPC-6
-                        0b0011_0000 | 0x2, // bits: support NormACA, modern LUN format; INQUIRY data version 2
-                        91,                // additional INQURIY data length
-                        0,                 // don't support various things
-                        0,                 // more things we don't have
-                        0b0000_0010,       // support command queueing
-                    ])
-                    .unwrap();
-
-                // TODO: register this or another name with T10
-                // incidentally, QEMU hasn't been registered - they should do that
-                data_in.write_all(b"rust-vmm").unwrap();
-                data_in.write_all(b"vhost-user-scsi ").unwrap();
-                data_in.write_all(b"v0  ").unwrap();
-                // fwiw, the Linux kernel doesn't request any more than this.
-                // no idea if anyone else does.
-                data_in.write_all(&[0; 22]).unwrap();
-
-                // TODO: are we getting these right? does anyone care?
-                let product_descs: &[u16; 8] = &[0xc0, 0x05c0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
-
-                for desc in product_descs {
-                    data_in.write_all(&desc.to_be_bytes()).unwrap();
-                }
-
-                data_in.write_all(&[0; 22]).unwrap();
-            }
-
-            CmdOutput::ok()
-        }
-        Command::ReportSupportedOperationCodes { rctd, mode } => {
-            hope!(!rctd);
-            match mode {
-                ReportSupportedOpCodesMode::All => todo!(),
-                ReportSupportedOpCodesMode::OneCommand(cmd) => {
-                    let ty = CommandType::from_opcode_and_sa(cmd, 0);
-                    data_in.write_all(&[0]).unwrap(); // unused flags
-                    if let Ok(ty) = ty {
-                        // supported, don't set a bunch of flags
-                        data_in.write_all(&[0b0000_0011]).unwrap();
-                        let tpl = ty.cdb_template();
-                        data_in
-                            .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
-                            .unwrap();
-                        data_in.write_all(tpl).unwrap();
-                    } else {
-                        println!("Reporting that we don't support command {:#2x}. It might be worth adding.", cmd);
-                        data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
-                        data_in.write_all(&[0; 2]).unwrap();
-                    }
-                    CmdOutput::ok()
-                }
-                ReportSupportedOpCodesMode::OneServiceAction(_, _) => todo!(),
-                ReportSupportedOpCodesMode::OneCommandOrServiceAction(_, _) => {
-                    todo!()
-                }
-            }
-        }
+        lun.execute_command(req, self)
     }
 }

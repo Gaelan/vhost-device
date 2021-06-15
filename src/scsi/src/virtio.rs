@@ -1,18 +1,15 @@
-use std::cell::Cell;
-use std::cmp::max;
-use std::cmp::min;
-use std::io;
-use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Write;
-use std::rc::Rc;
+use std::{
+    cell::Cell,
+    cmp::{max, min},
+    io,
+    io::{ErrorKind, Read, Write},
+    rc::Rc,
+};
 
-use crate::hope;
-use crate::scsi::command::Cdb;
-use vm_memory::Bytes;
-use vm_memory::GuestAddress;
-use vm_memory::GuestAddressSpace;
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 use vm_virtio::{Descriptor, DescriptorChain, DescriptorChainRwIter};
+
+use crate::{hope, scsi::command::Cdb};
 
 /// virtio-scsi has its own format for LUNs, documented in 5.6.6.1 of virtio
 /// v1.1. This represents a LUN parsed from that format.
@@ -26,8 +23,8 @@ impl VirtioScsiLun {
     pub fn parse(bytes: [u8; 8]) -> Option<Self> {
         // println!(
         //     "LUN: {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
-        //     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-        // );
+        //     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+        // bytes[7] );
         if bytes == [0xc1, 0x01, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0] {
             Some(Self::ReportLuns)
         } else if bytes[0] == 0x1 {
@@ -204,10 +201,52 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     }
 }
 
-pub struct DescriptorChainReader;
+pub struct DescriptorChainReader<M: GuestAddressSpace + Clone> {
+    chain: DescriptorChain<M>,
+    iter: DescriptorChainRwIter<M>,
+    current: Option<Descriptor>,
+    offset: u32,
+    // read: u32,
+}
 
-impl Read for DescriptorChainReader {
+impl<M: GuestAddressSpace + Clone> DescriptorChainReader<M> {
+    pub fn new(chain: DescriptorChain<M>) -> Self {
+        let mut iter = chain.clone().readable();
+        let current = iter.next();
+        Self {
+            chain,
+            iter,
+            current,
+            offset: 0,
+        }
+    }
+}
+
+impl<M: GuestAddressSpace + Clone> Read for DescriptorChainReader<M> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
+        if let Some(current) = self.current {
+            let left_in_descriptor = current.len() - self.offset;
+            let to_read = min(left_in_descriptor, buf.len() as u32);
+
+            let read = self
+                .chain
+                .memory()
+                .read(
+                    &mut buf[..(to_read as usize)],
+                    GuestAddress(current.addr().0 + u64::from(self.offset)),
+                )
+                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+
+            self.offset += read as u32;
+
+            if self.offset == current.len() {
+                self.current = self.iter.next();
+                self.offset = 0;
+            }
+
+            Ok(read)
+        } else {
+            Ok(0)
+        }
     }
 }

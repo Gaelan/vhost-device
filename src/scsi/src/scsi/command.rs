@@ -1,7 +1,20 @@
-use crate::scsi::mode_page::ModePage;
-use num_enum::TryFromPrimitive;
+//! Data structures and parsing code for SCSI commands. A rough overview:
+//! We need to deal with opcodes in two places: in parsing commands themselves,
+//! and in implementing REPORT SUPPORTED OPERATION CODES. Therefore, we parse
+//! commands in two steps. First, we parse the opcode (and sometimes service
+//! action) into a `CommandType` (a C-style enum containing just the commands,
+//! not their parameters), then using that, we parse the rest of the CDB and
+//! obtain a `Cdb`, which consists of a `Command`, an enum representing a
+//! command and its parameters, along with some fields shared across many or all
+//! commands.
+
 use std::convert::{TryFrom, TryInto};
 
+use num_enum::TryFromPrimitive;
+
+use crate::scsi::mode_page::ModePage;
+
+/// One of the modes supported by SCSI's REPORT LUNS command.
 #[derive(PartialEq, Eq, TryFromPrimitive, Debug, Copy, Clone)]
 #[repr(u8)]
 pub enum ReportLunsSelectReport {
@@ -10,8 +23,9 @@ pub enum ReportLunsSelectReport {
     All = 0x2,
 }
 
+/// A type of "vital product data" page returned by SCSI's INQUIRY command.
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
-pub enum InquiryPageCode {
+pub enum VpdPage {
     Ascii(u8),
     Ata,                        // *
     BlockDeviceCharacteristics, // *
@@ -50,7 +64,7 @@ pub enum ModeSensePageControl {
     Saved = 0b11,
 }
 
-impl TryFrom<u8> for InquiryPageCode {
+impl TryFrom<u8> for VpdPage {
     type Error = ();
 
     fn try_from(val: u8) -> Result<Self, ()> {
@@ -86,35 +100,35 @@ impl TryFrom<u8> for InquiryPageCode {
     }
 }
 
-impl From<InquiryPageCode> for u8 {
-    fn from(pc: InquiryPageCode) -> Self {
+impl From<VpdPage> for u8 {
+    fn from(pc: VpdPage) -> Self {
         match pc {
-            InquiryPageCode::Ascii(val) => val,
-            InquiryPageCode::Ata => 0x89,
-            InquiryPageCode::BlockDeviceCharacteristics => 0xb1,
-            InquiryPageCode::BlockDeviceCharacteristicsExt => 0xb5,
-            InquiryPageCode::BlockLimits => 0xb0,
-            InquiryPageCode::BlockLimitsExt => 0xb7,
-            InquiryPageCode::CfaProfile => 0x8c,
-            InquiryPageCode::DeviceConstituents => 0x8b,
-            InquiryPageCode::DeviceIdentification => 0x83,
-            InquiryPageCode::ExtendedInquiry => 0x86,
-            InquiryPageCode::FormatPresets => 0xb8,
-            InquiryPageCode::LogicalBlockProvisioning => 0xb2,
-            InquiryPageCode::ManagementNetworkAddresses => 0x85,
-            InquiryPageCode::ModePagePolicy => 0x87,
-            InquiryPageCode::PowerCondition => 0x8a,
-            InquiryPageCode::PowerConsumption => 0x8d,
-            InquiryPageCode::PortocolSpecificLogicalUnit => 0x90,
-            InquiryPageCode::ProtocolSpecificPort => 0x91,
-            InquiryPageCode::Referrals => 0xb3,
-            InquiryPageCode::ScsiFeatureSets => 0x92,
-            InquiryPageCode::ScsiPorts => 0x88,
-            InquiryPageCode::SoftwareInterfaceIdentification => 0x84,
-            InquiryPageCode::SupportedVpdPages => 0x00,
-            InquiryPageCode::ThirdPartyCopy => 0x8f,
-            InquiryPageCode::UnitSerialNumber => 0x80,
-            InquiryPageCode::ZonedBlockDeviceCharacteristics => 0xb6,
+            VpdPage::Ascii(val) => val,
+            VpdPage::Ata => 0x89,
+            VpdPage::BlockDeviceCharacteristics => 0xb1,
+            VpdPage::BlockDeviceCharacteristicsExt => 0xb5,
+            VpdPage::BlockLimits => 0xb0,
+            VpdPage::BlockLimitsExt => 0xb7,
+            VpdPage::CfaProfile => 0x8c,
+            VpdPage::DeviceConstituents => 0x8b,
+            VpdPage::DeviceIdentification => 0x83,
+            VpdPage::ExtendedInquiry => 0x86,
+            VpdPage::FormatPresets => 0xb8,
+            VpdPage::LogicalBlockProvisioning => 0xb2,
+            VpdPage::ManagementNetworkAddresses => 0x85,
+            VpdPage::ModePagePolicy => 0x87,
+            VpdPage::PowerCondition => 0x8a,
+            VpdPage::PowerConsumption => 0x8d,
+            VpdPage::PortocolSpecificLogicalUnit => 0x90,
+            VpdPage::ProtocolSpecificPort => 0x91,
+            VpdPage::Referrals => 0xb3,
+            VpdPage::ScsiFeatureSets => 0x92,
+            VpdPage::ScsiPorts => 0x88,
+            VpdPage::SoftwareInterfaceIdentification => 0x84,
+            VpdPage::SupportedVpdPages => 0x00,
+            VpdPage::ThirdPartyCopy => 0x8f,
+            VpdPage::UnitSerialNumber => 0x80,
+            VpdPage::ZonedBlockDeviceCharacteristics => 0xb6,
         }
     }
 }
@@ -142,7 +156,7 @@ pub enum Command {
         group_number: u8,
         transfer_length: u16,
     },
-    Inquiry(Option<InquiryPageCode>),
+    Inquiry(Option<VpdPage>),
     ReportSupportedOperationCodes {
         rctd: bool,
         mode: ReportSupportedOpCodesMode,
@@ -183,7 +197,7 @@ impl CommandType {
             })
             .map(|&(ty, _)| ty)
             .ok_or_else(|| {
-                // This is a little weird: it's usually InvalidCommand, but
+                // This is a little weird: it's usually InvalidCommand, but if
                 // it's a valid opcode and invalid service action, that's
                 // InvalidField
                 let mut opcodes = OPCODES.iter().map(|(_, opcode)| opcode);

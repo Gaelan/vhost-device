@@ -3,8 +3,7 @@
 #![warn(missing_debug_implementations)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::clippy::module_name_repetitions)]
-mod image;
-mod request;
+mod virtio;
 #[macro_use]
 mod utils;
 // mod mem_utils;
@@ -12,117 +11,144 @@ mod scsi;
 
 use std::{
     convert::TryInto,
+    io::Read,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
 };
 
-use image::Image;
-use request::VirtioScsiLun;
 use structopt::StructOpt;
 use vhost::vhost_user::{
     message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
     Listener,
 };
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon};
+use virtio::VirtioScsiLun;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
-use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::{
-    request::{DescriptorChainReader, DescriptorChainWriter, Response, VirtioScsiResponse},
-    scsi::TaskAttr,
+    scsi::{block_device::BlockDevice, EmulatedTarget, TaskAttr},
+    virtio::{Response, VirtioScsiResponse},
 };
 
 const CDB_SIZE: usize = 32; // TODO: default; can change
 const SENSE_SIZE: usize = 96; // TODO: default; can change
 
+// XXX: this type is ridiculous; can we make it less so?
+type DescriptorChainWriter = virtio::DescriptorChainWriter<GuestMemoryAtomic<GuestMemoryMmap>>;
+type DescriptorChainReader = virtio::DescriptorChainReader<GuestMemoryAtomic<GuestMemoryMmap>>;
+type Target = dyn scsi::Target<DescriptorChainWriter, DescriptorChainReader>;
+
 struct VhostUserScsiBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    image: Mutex<Image>,
+    // image: Mutex<BlockDevice>,
+    targets: Vec<Box<Target>>,
 }
 
 impl VhostUserScsiBackend {
-    fn new(image: Image) -> Self {
+    fn new() -> Self {
         Self {
             mem: None,
-            image: Mutex::new(image),
+            // image: Mutex::new(image),
+            targets: Vec::new(),
         }
     }
 }
 
-fn handle_control_queue(
-    buf: &[u8],
-    writer: &mut DescriptorChainWriter<impl GuestAddressSpace + Clone>,
-) {
-    dbg!(buf[0]);
-    todo!();
-}
+impl VhostUserScsiBackend {
+    fn handle_control_queue(
+        &self,
+        reader: &mut DescriptorChainReader,
+        writer: &mut DescriptorChainWriter,
+    ) {
+        // dbg!(buf[0]);
+        todo!();
+    }
 
-fn handle_request_queue(
-    buf: &[u8],
-    writer: &mut DescriptorChainWriter<impl GuestAddressSpace + Clone>,
-    image: &mut Image,
-) {
-    // unwrap is safe unless it's too short - we just sliced 8 out
-    // TODO: but it does panic if it's too short
-    let lun = VirtioScsiLun::parse(buf[0..8].try_into().unwrap()).unwrap();
-    let id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    fn parse_target(&self, lun: VirtioScsiLun) -> Option<(&Target, u16)> {
+        match lun {
+            VirtioScsiLun::TargetLun(target, lun) => self
+                .targets
+                .get(usize::from(target))
+                .map(|tgt| (tgt.as_ref(), lun)),
+            // TODO: do we need to handle the REPORT LUNS well-known LUN?
+            // In practice, everyone seems to just use LUN 0
+            VirtioScsiLun::ReportLuns => None,
+        }
+    }
 
-    let task_attr = match buf[16] {
-        0 => TaskAttr::Simple,
-        1 => TaskAttr::Ordered,
-        2 => TaskAttr::HeadOfQueue,
-        3 => TaskAttr::Aca,
-        _ => todo!(),
-    };
-    let prio = buf[17];
-    let crn = buf[18];
-    let cdb = &buf[19..(19 + CDB_SIZE)];
+    fn handle_request_queue(
+        &self,
+        reader: &mut DescriptorChainReader,
+        writer: &mut DescriptorChainWriter,
+    ) {
+        let mut buf = [0; 19 + CDB_SIZE];
+        reader.read_exact(&mut buf).unwrap();
+        // unwrap is safe, we just sliced 8 out
+        let lun = VirtioScsiLun::parse(buf[0..8].try_into().unwrap()).unwrap();
+        let id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
 
-    let mut body_writer = writer.clone();
-    body_writer.skip(108); // header + 96 (default sense size)
+        let task_attr = match buf[16] {
+            0 => TaskAttr::Simple,
+            1 => TaskAttr::Ordered,
+            2 => TaskAttr::HeadOfQueue,
+            3 => TaskAttr::Aca,
+            _ => todo!(),
+        };
+        let prio = buf[17];
+        let crn = buf[18];
+        let cdb = &buf[19..(19 + CDB_SIZE)];
 
-    let response = if lun == VirtioScsiLun::TargetLun(0, 0) {
-        let output = scsi::execute_command(
-            scsi::Request {
+        let mut body_writer = writer.clone();
+        body_writer.skip(108); // header + 96 (default sense size)
+
+        let response = if let Some((target, lun)) = self.parse_target(lun) {
+            let output = target.execute_command(
                 lun,
-                id,
-                cdb,
-                task_attr,
-                data_in: &mut body_writer,
-                data_out: &mut DescriptorChainReader,
-                crn,
-                prio,
-            },
-            image,
-        );
+                scsi::Request {
+                    id,
+                    cdb,
+                    task_attr,
+                    data_in: &mut body_writer,
+                    data_out: reader,
+                    crn,
+                    prio,
+                },
+            );
 
-        println!("Command result: {:?}", output.status);
+            println!("Command result: {:?}", output.status);
 
-        assert!(output.sense.len() < SENSE_SIZE);
+            assert!(output.sense.len() < SENSE_SIZE);
 
-        Response {
-            response: VirtioScsiResponse::Ok,
-            status: output.status,
-            status_qualifier: output.status_qualifier,
-            sense: output.sense,
-            residual: body_writer.residual(),
-        }
-    } else {
-        println!("Rejecting command to {:?}", lun);
-        Response {
-            response: VirtioScsiResponse::BadTarget,
-            status: 0,
-            status_qualifier: 0,
-            sense: Vec::new(),
-            residual: body_writer.residual(),
-        }
-    };
+            Response {
+                response: VirtioScsiResponse::Ok,
+                status: output.status,
+                status_qualifier: output.status_qualifier,
+                sense: output.sense,
+                // TODO: handle residual for data in
+                residual: body_writer.residual(),
+            }
+        } else {
+            println!("Rejecting command to {:?}", lun);
+            Response {
+                response: VirtioScsiResponse::BadTarget,
+                status: 0,
+                status_qualifier: 0,
+                sense: Vec::new(),
+                residual: body_writer.residual(),
+            }
+        };
 
-    // dbg!(body_writer.written);
-    // hope!(body_writer.done());
+        // dbg!(body_writer.written);
+        // hope!(body_writer.done());
 
-    response.write(writer).unwrap();
+        response.write(writer).unwrap();
+    }
+
+    fn add_target(&mut self, target: Box<Target>) {
+        self.targets.push(target);
+    }
 }
 
 impl VhostUserBackend for VhostUserScsiBackend {
@@ -153,7 +179,8 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
     fn set_event_idx(&mut self, enabled: bool) {
         dbg!();
-        assert!(!enabled) // should always be true until we support EVENT_IDX in features
+        assert!(!enabled) // should always be true until we support EVENT_IDX in
+                          // features
     }
 
     fn update_memory(
@@ -185,21 +212,22 @@ impl VhostUserBackend for VhostUserScsiBackend {
         let mut used = Vec::new();
 
         for dc in queue.iter().unwrap() {
-            let mem = dc.memory();
+            // let mem = dc.memory();
 
-            let mut iter = dc.clone().readable();
-            let d = iter.next().unwrap();
-            hope!(iter.next().is_none());
+            // let mut iter = dc.clone().readable();
+            // let d = iter.next().unwrap();
+            // hope!(iter.next().is_none());
 
-            let mut s: Vec<u8> = vec![0; d.len() as usize];
-            mem.read_slice(&mut s[..], d.addr()).unwrap();
+            // let mut s: Vec<u8> = vec![0; d.len() as usize];
+            // mem.read_slice(&mut s[..], d.addr()).unwrap();
 
             let mut writer = DescriptorChainWriter::new(dc.clone());
+            let mut reader = DescriptorChainReader::new(dc.clone());
             match device_event {
-                0 => handle_control_queue(&s, &mut writer),
+                0 => self.handle_control_queue(&mut reader, &mut writer),
                 2 => {
-                    let mut img = self.image.lock().unwrap();
-                    handle_request_queue(&s, &mut writer, &mut *img)
+                    // let mut img = self.image.lock().unwrap();
+                    self.handle_request_queue(&mut reader, &mut writer)
                 }
                 _ => todo!(),
             }
@@ -264,13 +292,18 @@ fn main() {
 
     let opt = Opt::from_args();
 
-    let img = Image::new(&opt.image).expect("opening image");
+    let mut backend = VhostUserScsiBackend::new();
+    let mut target = EmulatedTarget::new();
 
-    let mut daemon = VhostUserDaemon::new(
-        "vhost-user-scsi".into(),
-        Arc::new(RwLock::new(VhostUserScsiBackend::new(img))),
-    )
-    .expect("Creating daemon");
+    for _ in 0..5 {
+        let dev = BlockDevice::new(&opt.image).expect("opening image");
+        target.add_lun(Box::new(dev));
+    }
+
+    backend.add_target(Box::new(target));
+
+    let mut daemon = VhostUserDaemon::new("vhost-user-scsi".into(), Arc::new(RwLock::new(backend)))
+        .expect("Creating daemon");
 
     dbg!();
 
