@@ -143,6 +143,7 @@ pub enum ModePageSelection {
 pub enum Command {
     TestUnitReady,
     ReportLuns(ReportLunsSelectReport),
+    ReadCapacity10,
     ReadCapacity16,
     ModeSense6 {
         pc: ModeSensePageControl,
@@ -166,18 +167,20 @@ pub enum Command {
 #[derive(Clone, Copy, Debug)]
 pub enum CommandType {
     TestUnitReady,
-    ReportLuns,
-    ReadCapacity16,
-    ModeSense6,
-    Read10,
     Inquiry,
+    ModeSense6,
+    ReadCapacity10,
+    Read10,
+    ReadCapacity16,
+    ReportLuns,
     ReportSupportedOperationCodes,
 }
 
-const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
+pub const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
     (CommandType::TestUnitReady, (0x0, None)),
     (CommandType::Inquiry, (0x12, None)),
     (CommandType::ModeSense6, (0x1a, None)),
+    (CommandType::ReadCapacity10, (0x25, None)),
     (CommandType::Read10, (0x28, None)),
     (CommandType::ReadCapacity16, (0x9e, Some(0x10))),
     (CommandType::ReportLuns, (0xa0, None)),
@@ -244,6 +247,18 @@ impl CommandType {
                 0b1111_1111,
                 0b1111_1111,
                 0b1111_1111,
+                0b0000_0000,
+                0b0000_0100,
+            ],
+            CommandType::ReadCapacity10 => &[
+                0x25,
+                0b0000_0000,
+                0b0000_0000,
+                0b0000_0000,
+                0b0000_0000,
+                0b0000_0000,
+                0b0000_0000,
+                0b0000_0000,
                 0b0000_0000,
                 0b0000_0100,
             ],
@@ -417,27 +432,26 @@ impl Cdb {
                         transfer_length: u16::from_be_bytes(buf[7..9].try_into().unwrap()),
                     },
                     allocation_length: None,
-                    naca: (buf[15] & 0b0000_0100) != 0,
-                })
-            }
-            CommandType::ReadCapacity16 => {
-                // READ CAPACITY (16)
-                Ok(Self {
-                    command: Command::ReadCapacity16,
-                    allocation_length: Some(u32::from_be_bytes(buf[10..14].try_into().unwrap())),
-                    naca: (buf[15] & 0b0000_0100) != 0,
-                })
-            }
-            CommandType::ReportLuns => {
-                // REPORT LUNS
-                Ok(Self {
-                    command: Command::ReportLuns(
-                        buf[2].try_into().map_err(|_| ParseError::InvalidField)?,
-                    ),
-                    allocation_length: Some(u32::from_be_bytes(buf[6..10].try_into().unwrap())),
                     naca: (buf[9] & 0b0000_0100) != 0,
                 })
             }
+            CommandType::ReadCapacity10 => Ok(Self {
+                command: Command::ReadCapacity10,
+                allocation_length: None,
+                naca: (buf[9] & 0b0000_0100) != 0,
+            }),
+            CommandType::ReadCapacity16 => Ok(Self {
+                command: Command::ReadCapacity16,
+                allocation_length: Some(u32::from_be_bytes(buf[10..14].try_into().unwrap())),
+                naca: (buf[15] & 0b0000_0100) != 0,
+            }),
+            CommandType::ReportLuns => Ok(Self {
+                command: Command::ReportLuns(
+                    buf[2].try_into().map_err(|_| ParseError::InvalidField)?,
+                ),
+                allocation_length: Some(u32::from_be_bytes(buf[6..10].try_into().unwrap())),
+                naca: (buf[9] & 0b0000_0100) != 0,
+            }),
             CommandType::ReportSupportedOperationCodes => {
                 // REPORT SUPPORTED OPERATION CODES
                 let rctd = buf[2] & 0b1000_0000 != 0;

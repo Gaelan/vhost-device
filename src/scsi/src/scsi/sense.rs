@@ -19,4 +19,5 @@ impl SenseTriple {
 }
 
 pub const INVALID_COMMAND_OPERATION_CODE: SenseTriple = SenseTriple(0x5, 0x20, 0x0);
+pub const LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE: SenseTriple = SenseTriple(0x5, 0x21, 0x0);
 pub const INVALID_FIELD_IN_CDB: SenseTriple = SenseTriple(0x5, 0x24, 0x0);

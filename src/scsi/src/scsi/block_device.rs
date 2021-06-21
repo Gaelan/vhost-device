@@ -6,13 +6,15 @@ use std::{
     path::Path,
 };
 
+use log::warn;
+
 use super::EmulatedTarget;
 use crate::{
     hope,
     scsi::{
         command::{
             Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl, ParseError,
-            ReportLunsSelectReport, ReportSupportedOpCodesMode, VpdPage,
+            ReportLunsSelectReport, ReportSupportedOpCodesMode, VpdPage, OPCODES,
         },
         mode_page::ModePage,
         sense, CmdOutput, DeviceType, LogicalUnit, Request, SilentlyTruncate, TaskAttr,
@@ -22,6 +24,8 @@ use crate::{
 pub struct BlockDevice {
     file: File,
     block_size: u32,
+    write_protected: bool,
+    solid_state: bool,
 }
 
 impl BlockDevice {
@@ -31,6 +35,8 @@ impl BlockDevice {
         Ok(Self {
             file: File::open(path)?,
             block_size: 512,
+            write_protected: false,
+            solid_state: false,
         })
     }
 
@@ -53,6 +59,14 @@ impl BlockDevice {
 
     pub const fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    pub fn set_write_protected(&mut self, wp: bool) {
+        self.write_protected = wp;
+    }
+
+    pub fn set_solid_state(&mut self, solid_state: bool) {
+        self.solid_state = solid_state;
     }
 }
 
@@ -111,6 +125,18 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
 
                 CmdOutput::ok()
             }
+            Command::ReadCapacity10 => {
+                let final_block: u32 = (self.size_in_blocks() - 1)
+                    .try_into()
+                    .unwrap_or(0xffff_ffff);
+                let block_size: u32 = self.block_size();
+
+                // n.b. this is the last block, ie (length-1), not length
+                data_in.write_all(&final_block.to_be_bytes()).unwrap();
+                data_in.write_all(&block_size.to_be_bytes()).unwrap();
+
+                CmdOutput::ok()
+            }
             Command::ReadCapacity16 => {
                 let final_block: u64 = self.size_in_blocks() - 1;
                 let block_size: u32 = self.block_size();
@@ -152,8 +178,12 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     .write_all(&[
                         pages_len + 3, // size in bytes after this one
                         0,             // medium type - 0 for SBC
-                        0b1000_0000,   // write protected, no DPOFUA support !!!! top bit WP
-                        0,             // block desc length
+                        if self.write_protected {
+                            0b1001_0000 // support WP and DPOFUA
+                        } else {
+                            0b0000_0000
+                        },
+                        0, // block desc length
                     ])
                     .unwrap();
 
@@ -178,9 +208,35 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 group_number,
                 transfer_length,
             } => {
-                hope!(!dpo);
-                hope!(!fua);
+                if dpo {
+                    // DPO is just a hint that the guest probably won't access
+                    // this any time soon, but we can ignore it
+                    warn!("Silently ignoring DPO flag")
+                }
+                if fua {
+                    // Somewhat weirdly, SCSI supports FUA on reads. Here's the
+                    // key bit: "A force unit access (FUA) bit set to one
+                    // specifies that the device server shall read the logical
+                    // blocks from… the medium. If the FUA bit is set to one
+                    // and a volatile cache contains a more recent version of a
+                    // logical block than… the medium, then, before reading the
+                    // logical block, the device server shall write the logical
+                    // block to… the medium."
+
+                    // I guess the idea is that you can read something back, and
+                    // be absolutely sure what you just read will persist.
+
+                    // So for our purposes, we need to make sure whatever we
+                    // return has been saved to disk. fsync()ing the whole image
+                    // is a bit blunt, but does the trick.
+
+                    self.file.sync_all().unwrap();
+                }
                 hope!(group_number == 0);
+
+                if u64::from(lba) + u64::from(transfer_length) > self.size_in_blocks() {
+                    return CmdOutput::check_condition(sense::LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE);
+                }
 
                 let bytes = self
                     .read_blocks(u64::from(lba), u64::from(transfer_length))
@@ -204,7 +260,28 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     match code {
                         VpdPage::SupportedVpdPages => {
                             // TODO: do we want to support other pages?
-                            out.push(0);
+                            out.push(VpdPage::SupportedVpdPages.into());
+                            out.push(VpdPage::BlockDeviceCharacteristics.into());
+                            out.push(VpdPage::LogicalBlockProvisioning.into());
+                        }
+                        VpdPage::BlockDeviceCharacteristics => {
+                            let rotation_rate: u16 = if self.solid_state {
+                                1 // non-rotational
+                            } else {
+                                0 // not reported
+                            };
+                            out.extend_from_slice(&rotation_rate.to_be_bytes());
+                            // nothing worth setting in the rest
+                            out.extend_from_slice(&[0; 58]);
+                        }
+                        VpdPage::LogicalBlockProvisioning => {
+                            out.push(0); // don't support threshold sets
+                            out.push(0b1110_0100); // support unmapping w/ UNMAP
+                                                   // and WRITE SAME (10 & 16),
+                                                   // don't support anchored
+                                                   // LBAs or group descriptors
+                            out.push(0b0000_0010); // thin provisioned
+                            out.push(0); // no threshold % support
                         }
                         _ => return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB),
                     }
@@ -250,10 +327,41 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 CmdOutput::ok()
             }
             Command::ReportSupportedOperationCodes { rctd, mode } => {
-                hope!(!rctd);
                 match mode {
-                    ReportSupportedOpCodesMode::All => todo!(),
+                    ReportSupportedOpCodesMode::All => {
+                        let cmd_len = if rctd { 20 } else { 8 };
+                        let len = u32::try_from(OPCODES.len() * cmd_len).unwrap();
+                        data_in.write_all(&len.to_be_bytes()).unwrap();
+                        for &(ty, (opcode, sa)) in OPCODES {
+                            data_in.write_all(&[opcode]).unwrap();
+                            data_in.write_all(&[0]).unwrap(); // reserved
+                            data_in.write_all(&sa.unwrap_or(0).to_be_bytes()).unwrap();
+                            data_in.write_all(&[0]).unwrap(); // reserved
+
+                            let ctdp: u8 = if rctd { 0b10 } else { 0b00 };
+                            let servactv: u8 = if sa.is_some() { 0b1 } else { 0b0 };
+                            data_in.write_all(&[ctdp | servactv]).unwrap();
+
+                            data_in
+                                .write_all(
+                                    &u16::try_from(ty.cdb_template().len())
+                                        .unwrap()
+                                        .to_be_bytes(),
+                                )
+                                .unwrap();
+
+                            if rctd {
+                                // timeout descriptor
+                                data_in.write_all(&[0xa]).unwrap(); // len
+                                data_in.write_all(&[0, 0]).unwrap(); // reserved, cmd specific
+                                data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                                data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                            }
+                        }
+                    }
+                    // TODO: incorrectly handles commands that should have an SA and vice versa
                     ReportSupportedOpCodesMode::OneCommand(cmd) => {
+                        hope!(!rctd);
                         let ty = CommandType::from_opcode_and_sa(cmd, 0);
                         data_in.write_all(&[0]).unwrap(); // unused flags
                         if let Ok(ty) = ty {
@@ -265,17 +373,34 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                                 .unwrap();
                             data_in.write_all(tpl).unwrap();
                         } else {
-                            println!("Reporting that we don't support command {:#2x}. It might be worth adding.", cmd);
+                            warn!("Reporting that we don't support command {:#2x}. It might be worth adding.", cmd);
                             data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
                             data_in.write_all(&[0; 2]).unwrap();
                         }
-                        CmdOutput::ok()
                     }
-                    ReportSupportedOpCodesMode::OneServiceAction(_, _) => todo!(),
+                    ReportSupportedOpCodesMode::OneServiceAction(opcode, sa) => {
+                        hope!(!rctd);
+                        let ty = CommandType::from_opcode_and_sa(opcode, sa);
+                        data_in.write_all(&[0]).unwrap(); // unused flags
+                        if let Ok(ty) = ty {
+                            // supported, don't set a bunch of flags
+                            data_in.write_all(&[0b0000_0011]).unwrap();
+                            let tpl = ty.cdb_template();
+                            data_in
+                                .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
+                                .unwrap();
+                            data_in.write_all(tpl).unwrap();
+                        } else {
+                            warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
+                            data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
+                            data_in.write_all(&[0; 2]).unwrap();
+                        }
+                    }
                     ReportSupportedOpCodesMode::OneCommandOrServiceAction(_, _) => {
                         todo!()
                     }
                 }
+                CmdOutput::ok()
             }
         }
     }

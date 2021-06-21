@@ -2,7 +2,8 @@
 #![warn(clippy::nursery)]
 #![warn(missing_debug_implementations)]
 #![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::clippy::module_name_repetitions)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::non_ascii_literal)]
 mod virtio;
 #[macro_use]
 mod utils;
@@ -281,10 +282,24 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
 #[derive(StructOpt, Debug)]
 struct Opt {
+    /// Make the images read-only.
+    ///
+    /// Currently, we don't actually support writes, but this is still useful:
+    /// if we tell Linux the disk is write-protected, it won't (due to a bug?)
+    /// allow us to poke at it with the SCSI generic API, which is quite
+    /// useful. But if we don't, it'll try to write to the disk on mount,
+    /// and fail.
+    #[structopt(long("read-only"), short("r"))]
+    read_only: bool,
+    /// Tell the guest this disk is non-rotational.
+    ///
+    /// Affects some heuristics in Linux around, for example, scheduling.
+    #[structopt(long("solid-state"), short("s"))]
+    solid_state: bool,
     #[structopt(parse(from_os_str))]
     sock: PathBuf,
     #[structopt(parse(from_os_str))]
-    image: PathBuf,
+    images: Vec<PathBuf>,
 }
 
 fn main() {
@@ -295,8 +310,10 @@ fn main() {
     let mut backend = VhostUserScsiBackend::new();
     let mut target = EmulatedTarget::new();
 
-    for _ in 0..5 {
-        let dev = BlockDevice::new(&opt.image).expect("opening image");
+    for image in opt.images {
+        let mut dev = BlockDevice::new(&image).expect("opening image");
+        dev.set_write_protected(opt.read_only);
+        dev.set_solid_state(opt.solid_state);
         target.add_lun(Box::new(dev));
     }
 
