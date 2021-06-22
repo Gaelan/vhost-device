@@ -13,8 +13,9 @@ use crate::{
     hope,
     scsi::{
         command::{
-            Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl, ParseError,
-            ReportLunsSelectReport, ReportSupportedOpCodesMode, VpdPage, OPCODES,
+            parse_opcode, Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl,
+            ParseError, ParseOpcodeResult, ReportLunsSelectReport, ReportSupportedOpCodesMode,
+            VpdPage, OPCODES,
         },
         mode_page::ModePage,
         sense, CmdOutput, DeviceType, LogicalUnit, Request, SilentlyTruncate, TaskAttr,
@@ -327,6 +328,28 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 CmdOutput::ok()
             }
             Command::ReportSupportedOperationCodes { rctd, mode } => {
+                fn one_command_supported(data_in: &mut impl Write, ty: CommandType) {
+                    data_in.write_all(&[0]).unwrap(); // unused flags
+                                                      // supported, don't set a bunch of flags
+                    data_in.write_all(&[0b0000_0011]).unwrap();
+                    let tpl = ty.cdb_template();
+                    data_in
+                        .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
+                        .unwrap();
+                    data_in.write_all(tpl).unwrap();
+                }
+                fn one_command_not_supported(data_in: &mut impl Write) {
+                    data_in.write_all(&[0]).unwrap(); // unused flags
+                    data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
+                    data_in.write_all(&[0; 2]).unwrap(); // cdb len
+                }
+                fn timeout_descriptor(data_in: &mut impl Write) {
+                    // timeout descriptor
+                    data_in.write_all(&0xa_u16.to_be_bytes()).unwrap(); // len
+                    data_in.write_all(&[0, 0]).unwrap(); // reserved, cmd specific
+                    data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                    data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                }
                 match mode {
                     ReportSupportedOpCodesMode::All => {
                         let cmd_len = if rctd { 20 } else { 8 };
@@ -351,53 +374,83 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                                 .unwrap();
 
                             if rctd {
-                                // timeout descriptor
-                                data_in.write_all(&[0xa]).unwrap(); // len
-                                data_in.write_all(&[0, 0]).unwrap(); // reserved, cmd specific
-                                data_in.write_all(&0_u32.to_be_bytes()).unwrap();
-                                data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                                timeout_descriptor(&mut data_in);
                             }
                         }
                     }
-                    // TODO: incorrectly handles commands that should have an SA and vice versa
-                    ReportSupportedOpCodesMode::OneCommand(cmd) => {
-                        hope!(!rctd);
-                        let ty = CommandType::from_opcode_and_sa(cmd, 0);
-                        data_in.write_all(&[0]).unwrap(); // unused flags
-                        if let Ok(ty) = ty {
-                            // supported, don't set a bunch of flags
-                            data_in.write_all(&[0b0000_0011]).unwrap();
-                            let tpl = ty.cdb_template();
-                            data_in
-                                .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
-                                .unwrap();
-                            data_in.write_all(tpl).unwrap();
-                        } else {
-                            warn!("Reporting that we don't support command {:#2x}. It might be worth adding.", cmd);
-                            data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
-                            data_in.write_all(&[0; 2]).unwrap();
+                    ReportSupportedOpCodesMode::OneCommand(opcode) => match parse_opcode(opcode) {
+                        ParseOpcodeResult::Command(ty) => {
+                            one_command_supported(&mut data_in, ty);
+
+                            if rctd {
+                                timeout_descriptor(&mut data_in);
+                            }
                         }
-                    }
+                        ParseOpcodeResult::ServiceAction(_) => {
+                            return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB);
+                        }
+                        ParseOpcodeResult::Invalid => {
+                            warn!("Reporting that we don't support command {:#2x}. It might be worth adding.", opcode);
+                            one_command_not_supported(&mut data_in);
+                        }
+                    },
                     ReportSupportedOpCodesMode::OneServiceAction(opcode, sa) => {
-                        hope!(!rctd);
-                        let ty = CommandType::from_opcode_and_sa(opcode, sa);
-                        data_in.write_all(&[0]).unwrap(); // unused flags
-                        if let Ok(ty) = ty {
-                            // supported, don't set a bunch of flags
-                            data_in.write_all(&[0b0000_0011]).unwrap();
-                            let tpl = ty.cdb_template();
-                            data_in
-                                .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
-                                .unwrap();
-                            data_in.write_all(tpl).unwrap();
-                        } else {
-                            warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
-                            data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
-                            data_in.write_all(&[0; 2]).unwrap();
+                        match parse_opcode(opcode) {
+                            ParseOpcodeResult::Command(_) => {
+                                return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB)
+                            }
+                            ParseOpcodeResult::ServiceAction(unparsed_sa) => {
+                                if let Some(ty) = unparsed_sa.parse(sa) {
+                                    one_command_supported(&mut data_in, ty);
+
+                                    if rctd {
+                                        timeout_descriptor(&mut data_in);
+                                    }
+                                } else {
+                                    warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
+                                    one_command_not_supported(&mut data_in);
+                                }
+                            }
+                            ParseOpcodeResult::Invalid => {
+                                // the spec isn't super clear what we're supposed to do here, but I
+                                // think an invalid opcode is one for which our implementation
+                                // "does not implement service actions", so we say invalid field in
+                                // CDB
+                                warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
+                                return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB);
+                            }
                         }
                     }
-                    ReportSupportedOpCodesMode::OneCommandOrServiceAction(_, _) => {
-                        todo!()
+                    ReportSupportedOpCodesMode::OneCommandOrServiceAction(opcode, sa) => {
+                        match parse_opcode(opcode) {
+                            ParseOpcodeResult::Command(ty) => {
+                                if sa == 0 {
+                                    one_command_supported(&mut data_in, ty);
+
+                                    if rctd {
+                                        timeout_descriptor(&mut data_in);
+                                    }
+                                } else {
+                                    one_command_not_supported(&mut data_in);
+                                }
+                            }
+                            ParseOpcodeResult::ServiceAction(unparsed_sa) => {
+                                if let Some(ty) = unparsed_sa.parse(sa) {
+                                    one_command_supported(&mut data_in, ty);
+
+                                    if rctd {
+                                        timeout_descriptor(&mut data_in);
+                                    }
+                                } else {
+                                    warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
+                                    one_command_not_supported(&mut data_in);
+                                }
+                            }
+                            ParseOpcodeResult::Invalid => {
+                                warn!("Reporting that we don't support command {:#2x}[/{:#2x}]. It might be worth adding.", opcode, sa);
+                                one_command_not_supported(&mut data_in);
+                            }
+                        }
                     }
                 }
                 CmdOutput::ok()

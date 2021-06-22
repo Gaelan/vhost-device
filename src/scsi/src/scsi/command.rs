@@ -190,35 +190,52 @@ pub const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
     ),
 ];
 
-impl CommandType {
-    pub fn from_opcode_and_sa(cmd_opcode: u8, cmd_sa: u16) -> Result<Self, ParseError> {
+#[derive(Debug, Clone, Copy)]
+pub struct UnparsedServiceAction(u8);
+impl UnparsedServiceAction {
+    pub fn parse(self, service_action: u16) -> Option<CommandType> {
         OPCODES
             .iter()
-            .find(|(_, opcode)| match *opcode {
-                (opcode, None) => cmd_opcode == opcode,
-                (opcode, Some(sa)) => cmd_opcode == opcode && cmd_sa == sa,
-            })
+            .find(|(_, opcode)| *opcode == (self.0, Some(service_action)))
             .map(|&(ty, _)| ty)
-            .ok_or_else(|| {
-                // This is a little weird: it's usually InvalidCommand, but if
-                // it's a valid opcode and invalid service action, that's
-                // InvalidField
-                let mut opcodes = OPCODES.iter().map(|(_, opcode)| opcode);
-                let is_invalid_sa = opcodes.any(|&(opcode, _)| opcode == cmd_opcode);
-                if is_invalid_sa {
-                    ParseError::InvalidField
-                } else {
-                    ParseError::InvalidCommand
-                }
-            })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ParseOpcodeResult {
+    /// The opcode represents a single command.
+    Command(CommandType),
+    /// The opcode requires a service action.
+    ServiceAction(UnparsedServiceAction),
+    /// The opcode is invalid.
+    Invalid,
+}
+
+pub fn parse_opcode(opcode: u8) -> ParseOpcodeResult {
+    let found = OPCODES.iter().find(|(_, (x, _))| *x == opcode);
+    match found {
+        Some(&(ty, (_, None))) => ParseOpcodeResult::Command(ty),
+        Some((_, (_, Some(_)))) => {
+            // we found some service action that uses this opcode; so this is a
+            // service action opcode, and we need the service action
+            ParseOpcodeResult::ServiceAction(UnparsedServiceAction(opcode))
+        }
+        None => ParseOpcodeResult::Invalid,
+    }
+}
+
+impl CommandType {
     fn from_cdb(cdb: &[u8]) -> Result<Self, ParseError> {
         // TODO: Variable-length CDBs put the service action in a different
-        // place. This'll need to change if we ever support those.
-        Self::from_opcode_and_sa(cdb[0], u16::from(cdb[1] & 0b0001_1111)).map_err(|e| {
-            dbg!(cdb);
-            e
-        })
+        // place. This'll need to change if we ever support those. IIRC, Linux
+        // doesn't ever use them, so it may never be relevant.
+        match parse_opcode(cdb[0]) {
+            ParseOpcodeResult::Command(ty) => Ok(ty),
+            ParseOpcodeResult::ServiceAction(sa) => sa
+                .parse(u16::from(cdb[1] & 0b0001_1111))
+                .ok_or(ParseError::InvalidField),
+            ParseOpcodeResult::Invalid => Err(ParseError::InvalidCommand),
+        }
     }
     /// Return the SCSI "CDB usage data" (see SPC-6 6.34.3) for this command
     /// type.
@@ -378,7 +395,7 @@ impl Cdb {
                 let page_code_raw = buf[2];
                 let page_code = match (evpd, page_code_raw) {
                     (false, 0) => None,
-                    (true, pc) => Some(dbg!(pc).try_into().map_err(|_| ParseError::InvalidField)?),
+                    (true, pc) => Some(pc.try_into().map_err(|_| ParseError::InvalidField)?),
                     (false, _) => return Err(ParseError::InvalidField),
                 };
                 Ok(Self {

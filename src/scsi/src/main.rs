@@ -154,32 +154,27 @@ impl VhostUserScsiBackend {
 
 impl VhostUserBackend for VhostUserScsiBackend {
     fn num_queues(&self) -> usize {
-        dbg!();
         let num_request_queues = 1;
         2 + num_request_queues
     }
 
     fn max_queue_size(&self) -> usize {
-        dbg!();
         128 // qemu assumes this by default
     }
 
     fn features(&self) -> u64 {
-        dbg!();
         // TODO: Any other ones worth implementing? EVENT_IDX and INDIRECT_DESC
         // are supported by virtiofsd
         1 << VIRTIO_F_VERSION_1 | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() | 1 << 2
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        dbg!();
         VhostUserProtocolFeatures::MQ
         // | VhostUserProtocolFeatures::REPLY_ACK
         // | VhostUserProtocolFeatures::SLAVE_REQ
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
-        dbg!();
         assert!(!enabled) // should always be true until we support EVENT_IDX in
                           // features
     }
@@ -188,7 +183,6 @@ impl VhostUserBackend for VhostUserScsiBackend {
         &mut self,
         atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> std::result::Result<(), std::io::Error> {
-        dbg!();
         self.mem = Some(atomic_mem);
         Ok(())
     }
@@ -247,36 +241,27 @@ impl VhostUserBackend for VhostUserScsiBackend {
         Ok(false) // what's this bool? no idea. virtiofd-rs returns false
     }
 
-    fn acked_features(&mut self, features: u64) {
-        dbg!(features);
-    }
+    // fn acked_features(&mut self, features: u64) {
+    //     dbg!(features);
+    // }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
-        dbg!();
-        todo!();
+        // QEMU handles config space itself
+        panic!("Access to configuration space is not supported.");
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> std::result::Result<(), std::io::Error> {
-        dbg!();
-        todo!();
+        // QEMU handles config space itself
+        panic!("Access to configuration space is not supported.");
     }
 
-    fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)> {
-        dbg!();
-        // let fd = EventFd::new(EFD_NONBLOCK).unwrap();
-        // let ret = Some((fd.try_clone().unwrap(), Some(3)));
-        // mem::forget(fd);
-        // ret
-        None
-    }
-
-    fn set_slave_req_fd(&mut self, _vu_req: vhost::vhost_user::SlaveFsCacheReq) {
-        dbg!();
-        // mem::forget(vu_req);
-    }
-
-    // fn queues_per_thread(&self) -> Vec<u64> {
-    //     vec![0xffff_ffff]
+    // fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)> {
+    //     dbg!();
+    //     // let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+    //     // let ret = Some((fd.try_clone().unwrap(), Some(3)));
+    //     // mem::forget(fd);
+    //     // ret
+    //     None
     // }
 }
 
@@ -322,17 +307,9 @@ fn main() {
     let mut daemon = VhostUserDaemon::new("vhost-user-scsi".into(), Arc::new(RwLock::new(backend)))
         .expect("Creating daemon");
 
-    dbg!();
-
     daemon
         .start(Listener::new(opt.sock, true).expect("listener"))
         .expect("starting daemon");
 
-    dbg!();
-
-    // daemon.get_vring_workers();
-
     daemon.wait().expect("waiting");
-
-    dbg!();
 }
