@@ -17,6 +17,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use log::info;
 use structopt::StructOpt;
 use vhost::vhost_user::{
     message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
@@ -26,7 +27,6 @@ use vhost_user_backend::{VhostUserBackend, VhostUserDaemon};
 use virtio::VirtioScsiLun;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
-use vmm_sys_util::eventfd::EventFd;
 
 use crate::{
     scsi::{block_device::BlockDevice, EmulatedTarget, TaskAttr},
@@ -183,6 +183,7 @@ impl VhostUserBackend for VhostUserScsiBackend {
         &mut self,
         atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> std::result::Result<(), std::io::Error> {
+        info!("Memory updated - guest probably booting");
         self.mem = Some(atomic_mem);
         Ok(())
     }
@@ -207,15 +208,6 @@ impl VhostUserBackend for VhostUserScsiBackend {
         let mut used = Vec::new();
 
         for dc in queue.iter().unwrap() {
-            // let mem = dc.memory();
-
-            // let mut iter = dc.clone().readable();
-            // let d = iter.next().unwrap();
-            // hope!(iter.next().is_none());
-
-            // let mut s: Vec<u8> = vec![0; d.len() as usize];
-            // mem.read_slice(&mut s[..], d.addr()).unwrap();
-
             let mut writer = DescriptorChainWriter::new(dc.clone());
             let mut reader = DescriptorChainReader::new(dc.clone());
             match device_event {
@@ -238,7 +230,7 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
         // todo!()
 
-        Ok(false) // what's this bool? no idea. virtiofd-rs returns false
+        Ok(false) // TODO: what's this bool? no idea. virtiofd-rs returns false
     }
 
     // fn acked_features(&mut self, features: u64) {
@@ -255,8 +247,8 @@ impl VhostUserBackend for VhostUserScsiBackend {
         panic!("Access to configuration space is not supported.");
     }
 
-    // fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)> {
-    //     dbg!();
+    // fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)>
+    // {     dbg!();
     //     // let fd = EventFd::new(EFD_NONBLOCK).unwrap();
     //     // let ret = Some((fd.try_clone().unwrap(), Some(3)));
     //     // mem::forget(fd);
@@ -270,10 +262,9 @@ struct Opt {
     /// Make the images read-only.
     ///
     /// Currently, we don't actually support writes, but this is still useful:
-    /// if we tell Linux the disk is write-protected, it won't (due to a bug?)
-    /// allow us to poke at it with the SCSI generic API, which is quite
-    /// useful. But if we don't, it'll try to write to the disk on mount,
-    /// and fail.
+    /// if we tell Linux the disk is write-protected, some tools using the SCSI
+    /// generic API won't work. But if we don't, it'll try to write to the disk
+    /// on mount, and fail.
     #[structopt(long("read-only"), short("r"))]
     read_only: bool,
     /// Tell the guest this disk is non-rotational.

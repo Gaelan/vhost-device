@@ -6,8 +6,8 @@ use std::{
     rc::Rc,
 };
 
+use virtio_queue::{Descriptor, DescriptorChain, DescriptorChainRwIter};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
-use vm_virtio::{Descriptor, DescriptorChain, DescriptorChainRwIter};
 
 use crate::{hope, scsi::command::Cdb};
 

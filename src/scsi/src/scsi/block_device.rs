@@ -211,7 +211,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
             } => {
                 if dpo {
                     // DPO is just a hint that the guest probably won't access
-                    // this any time soon, but we can ignore it
+                    // this any time soon, so we can ignore it
                     warn!("Silently ignoring DPO flag")
                 }
                 if fua {

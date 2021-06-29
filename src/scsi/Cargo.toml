@@ -14,7 +14,7 @@ vhost = { git = "https://github.com/rust-vmm/vhost" }
 virtio-bindings = "0.1.0"
 env_logger = "0.8.3"
 num_enum = "0.5.1"
-vm-virtio = { git = "https://github.com/rust-vmm/vm-virtio" }
+virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio" }
 vmm-sys-util = "0.8.0"
 structopt = "0.3"
 log = "0.4.14"
