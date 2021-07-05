@@ -352,8 +352,14 @@ pub struct Cdb {
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum ParseError {
+    /// The opcode (specifically the first byte of the CDB) is unknown, i.e. we
+    /// should respond with INVALID COMMAND OPERATION CODE
     InvalidCommand,
+    /// Another field of the CDB (including the service action, if any) is
+    /// invalid, i.e. we should respond with INVALID FIELD IN CDB.
     InvalidField,
+    /// The CDB has fewer bytes than necessary for its opcode.
+    TooSmall,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -369,12 +375,14 @@ impl Cdb {
     // start doing that
     // TODO: do we want to ensure reserved fields are 0? SCSI allows, but
     // doesn't require, us to do so.
-    // #[deny(clippy::clippy::indexing_slicing)]
     // See comment in mod.rs - I don't think we gain anything splitting this
     // into functions
     #[allow(clippy::clippy::too_many_lines)]
     pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
         let ct = CommandType::from_cdb(buf)?;
+        if buf.len() < ct.cdb_template().len() {
+            return Err(ParseError::TooSmall);
+        }
         match ct {
             CommandType::TestUnitReady => {
                 // TEST UNIT READY

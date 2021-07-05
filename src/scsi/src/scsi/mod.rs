@@ -7,7 +7,7 @@ mod tests;
 use std::{
     cmp::min,
     convert::TryFrom,
-    io::{Read, Write},
+    io::{self, Read, Write},
 };
 
 use self::sense::SenseTriple;
@@ -92,17 +92,35 @@ pub struct Request<'a, W: Write, R: Read> {
 }
 
 pub trait Target<W: Write, R: Read>: Send + Sync {
-    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> CmdOutput;
+    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> Result<CmdOutput, CmdError>;
 }
 
 pub trait LogicalUnit<W: Write, R: Read>: Send + Sync {
-    fn execute_command(&self, req: Request<'_, W, R>, target: &EmulatedTarget<W, R>) -> CmdOutput;
+    /// Process a SCSI command sent to this logical unit.
+    ///
+    /// # Return value
+    /// This function returns a Result, but it should only return Err in one
+    /// circumstance: when an attempt to transfer data via `req.data_in` or
+    /// `req.data_out` fails, in which case it should pass that error through.
+    /// Any other errors, such as invalid SCSI commands or I/O errors
+    /// accessing an underlying file, should result in an Ok return value
+    /// with a `CmdOutput` representing a SCSI-level error (i.e. CHECK
+    /// CONDITION status, and appropriate sense data).
+    fn execute_command(
+        &self,
+        req: Request<'_, W, R>,
+        target: &EmulatedTarget<W, R>,
+    ) -> Result<CmdOutput, CmdError>;
 }
 
 struct MissingLun;
 
 impl<W: Write, R: Read> LogicalUnit<W, R> for MissingLun {
-    fn execute_command(&self, _: Request<'_, W, R>, target: &EmulatedTarget<W, R>) -> CmdOutput {
+    fn execute_command(
+        &self,
+        _: Request<'_, W, R>,
+        target: &EmulatedTarget<W, R>,
+    ) -> Result<CmdOutput, CmdError> {
         todo!()
     }
 }
@@ -129,7 +147,7 @@ impl<W: Write, R: Read> EmulatedTarget<W, R> {
 }
 
 impl<W: Write, R: Read> Target<W, R> for EmulatedTarget<W, R> {
-    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> CmdOutput {
+    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> Result<CmdOutput, CmdError> {
         let lun: &dyn LogicalUnit<W, R> = self
             .luns
             .get(lun as usize)
@@ -137,4 +155,16 @@ impl<W: Write, R: Read> Target<W, R> for EmulatedTarget<W, R> {
 
         lun.execute_command(req, self)
     }
+}
+
+/// An transport-level error encountered while processing a SCSI command.
+///
+/// This is only for transport-level errors; anything else should be handled by
+/// returning a CHECK CONDITION status at the SCSI level.
+#[derive(Debug)]
+pub enum CmdError {
+    /// The provided CDB is too short for its operation code.
+    CdbTooShort,
+    /// An error occurred while writing to the provided data in writer.
+    DataIn(io::Error),
 }

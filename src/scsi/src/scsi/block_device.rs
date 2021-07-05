@@ -7,8 +7,9 @@ use std::{
 };
 
 use log::warn;
+use CmdError::DataIn;
 
-use super::EmulatedTarget;
+use super::{CmdError, EmulatedTarget};
 use crate::{
     hope,
     scsi::{
@@ -41,8 +42,9 @@ impl BlockDevice {
         })
     }
 
-    pub fn read_blocks(&self, lba: u64, blocks: u64) -> io::Result<Vec<u8>> {
-        // This is a ton of copies. It should be none.
+    fn read_blocks(&self, lba: u64, blocks: u64) -> io::Result<Vec<u8>> {
+        // TODO: Ideally, this would be a read_vectored directly into guest
+        // address space. Instead, we have an allocation and several copies.
 
         let mut ret = vec![0; (blocks * u64::from(self.block_size)) as usize];
 
@@ -75,22 +77,41 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
     // TODO: would this be more readable split into functions? I lean towards
     // thinking it just adds boilderplate, but not sure
     #[allow(clippy::too_many_lines)]
-    fn execute_command(&self, req: Request<'_, W, R>, target: &EmulatedTarget<W, R>) -> CmdOutput {
-        // dbg!(lun, id, task_attr, crn, prio);
-        hope!(req.crn == 0);
-        hope!(req.task_attr == TaskAttr::Simple);
-        hope!(req.prio == 0);
+    fn execute_command(
+        &self,
+        req: Request<'_, W, R>,
+        target: &EmulatedTarget<W, R>,
+    ) -> Result<CmdOutput, CmdError> {
+        if req.crn != 0 {
+            // CRN is a weird bit of the protocol we wouldn't ever expect to be used over
+            // virtio-scsi; but it's allowed to set it non-zero
+            warn!("Recieved non-zero CRN: {}", req.crn)
+        }
+        if req.task_attr != TaskAttr::Simple {
+            // virtio-scsi spec allows us to treat all task attrs as SIMPLE.
+            warn!("Ignoring non-simple task attr of {:?}", req.task_attr);
+        }
+        if req.prio != 0 {
+            // My reading of SAM-6 is that priority is purely advisory, so it's fine to
+            // ignore it.
+            warn!("Ignoring non-zero priority of {}.", req.prio);
+        }
 
         let cdb = match Cdb::parse(req.cdb) {
             Ok(cdb) => cdb,
             Err(ParseError::InvalidCommand) => {
-                return CmdOutput::check_condition(sense::INVALID_COMMAND_OPERATION_CODE)
+                return Ok(CmdOutput::check_condition(
+                    sense::INVALID_COMMAND_OPERATION_CODE,
+                ))
             }
             // TODO: SCSI has a provision for INVALID FIELD IN CDB to include the
             // index of the invalid field, but it's not clear if that's mandatory.
             // In any case, QEMU omits it.
             Err(ParseError::InvalidField) => {
-                return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB)
+                return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB))
+            }
+            Err(ParseError::TooSmall) => {
+                panic!("")
             }
         };
 
@@ -103,64 +124,88 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
 
         println!("Incoming command: {:?}", &cdb);
 
+        // style note: throughout this code, we use u{8,16,32,16}::to_be_bytes(foo)
+        // instead of foo.to_be_bytes(). This allows us to see the layout of our
+        // response in one place, instead of having to go hunting for where foo is
+        // declared to determine its size.
+        // exception: when the size occurs earlier in the same line, e.g.
+        // u64::from(foo).to_be_bytes()
+
+        // TODO: make that true
+
         match cdb.command {
-            Command::TestUnitReady => CmdOutput::ok(),
+            Command::TestUnitReady => Ok(CmdOutput::ok()),
             Command::ReportLuns(select_report) => {
                 fn encode_lun(lun: u16) -> [u8; 8] {
+                    // TODO: actually understand the LUN format, esp for luns over 256
                     hope!(lun < 256);
                     [0, lun.try_into().unwrap(), 0, 0, 0, 0, 0, 0]
                 }
-                // TODO: actually understand the LUN format
-                // in particular, I think this is wrong over 256 LUNs
                 let luns = target.luns().map(encode_lun);
 
                 hope!(select_report == ReportLunsSelectReport::NoWellKnown);
 
+                // TODO: unwrap is safe-ish: luns.len() should never be over 2^16. We don't
+                // actually have a proper check for that yet, though.
                 data_in
                     .write_all(&(u32::try_from(luns.len() * 8)).unwrap().to_be_bytes())
-                    .unwrap();
-                data_in.write_all(&[0; 4]).unwrap();
+                    .map_err(DataIn)?;
+                data_in.write_all(&[0; 4]).map_err(DataIn)?; // reserved
                 for lun in luns {
-                    data_in.write_all(&lun).unwrap();
+                    data_in.write_all(&lun).map_err(DataIn)?;
                 }
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::ReadCapacity10 => {
+                // READ CAPACITY (10) returns a 32-bit LBA, which may not be enough. If it
+                // isn't, we're supposed to return 0xffff_ffff and hope the driver gets the memo
+                // and uses the newer READ CAPACITY (16).
+                // n.b. this is the last block, ie (length-1), not length
                 let final_block: u32 = (self.size_in_blocks() - 1)
                     .try_into()
                     .unwrap_or(0xffff_ffff);
                 let block_size: u32 = self.block_size();
 
-                // n.b. this is the last block, ie (length-1), not length
-                data_in.write_all(&final_block.to_be_bytes()).unwrap();
-                data_in.write_all(&block_size.to_be_bytes()).unwrap();
+                data_in
+                    .write_all(&u32::to_be_bytes(final_block))
+                    .map_err(DataIn)?;
+                data_in
+                    .write_all(&u32::to_be_bytes(block_size))
+                    .map_err(DataIn)?;
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::ReadCapacity16 => {
+                // n.b. this is the last block, ie (length-1), not length
                 let final_block: u64 = self.size_in_blocks() - 1;
                 let block_size: u32 = self.block_size();
 
-                // n.b. this is the last block, ie (length-1), not length
-                data_in.write_all(&final_block.to_be_bytes()).unwrap();
-                data_in.write_all(&block_size.to_be_bytes()).unwrap();
+                data_in
+                    .write_all(&u64::to_be_bytes(final_block))
+                    .map_err(DataIn)?;
+                data_in
+                    .write_all(&u32::to_be_bytes(block_size))
+                    .map_err(DataIn)?;
+
                 // no protection stuff; 1-to-1 logical/physical blocks
-                data_in.write_all(&[0, 0]).unwrap();
+                data_in.write_all(&[0, 0]).map_err(DataIn)?;
 
                 // top 2 bits: thin provisioning stuff; other 14 bits are lowest
-                // aligned LBA
-                data_in.write_all(&[0b1100_0000, 0]).unwrap();
+                // aligned LBA, which is zero
+                data_in.write_all(&[0b1100_0000, 0]).map_err(DataIn)?;
 
                 // reserved
-                data_in.write_all(&[0; 16]).unwrap();
+                data_in.write_all(&[0; 16]).map_err(DataIn)?;
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::ModeSense6 { mode_page, pc, dbd } => {
                 hope!(pc == ModeSensePageControl::Current);
                 hope!(!dbd);
 
+                // we use this for the pages array if we only need a single element; lifetime
+                // rules mean it has to be declared here
                 let single_page_array: [ModePage; 1];
 
                 let pages = match mode_page {
@@ -172,6 +217,14 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 };
 
                 let pages_len: u32 = pages.iter().map(|x| u32::from(x.page_length() + 2)).sum();
+                // SPC-6r05, 7.5.6: "Logical units that support more than 256 bytes of block
+                // descriptors and mode pages should implement ten-byte mode commands. The MODE
+                // DATA LENGTH field in the six-byte CDB header limits the transferred data to
+                // 256 bytes."
+                // Unclear what exactly we're supposed to do if we have more than 256 bytes of
+                // mode pages and get sent a MODE SENSE (6). In any case, we don't at the
+                // moment; if we ever get that much, this unwrap() will start
+                // crashing us and we can figure out what to do.
                 let pages_len = u8::try_from(pages_len).unwrap();
 
                 // mode parameter header
@@ -186,7 +239,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         },
                         0, // block desc length
                     ])
-                    .unwrap();
+                    .map_err(DataIn)?;
 
                 // TODO: block descriptors are optional. does anyone care?
 
@@ -200,7 +253,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     page.write(&mut data_in);
                 }
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::Read10 {
                 dpo,
@@ -236,16 +289,18 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 hope!(group_number == 0);
 
                 if u64::from(lba) + u64::from(transfer_length) > self.size_in_blocks() {
-                    return CmdOutput::check_condition(sense::LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE);
+                    return Ok(CmdOutput::check_condition(
+                        sense::LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
+                    ));
                 }
 
                 let bytes = self
                     .read_blocks(u64::from(lba), u64::from(transfer_length))
                     .unwrap();
 
-                data_in.write_all(&bytes[..]).unwrap();
+                data_in.write_all(&bytes[..]).map_err(DataIn)?;
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::Inquiry(page_code) => {
                 // TODO: we should also be responding to INQUIRies to bad LUNs, but
@@ -254,7 +309,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 // top bits 0: peripheral device code = exists and ready
                 data_in
                     .write_all(&[DeviceType::DirectAccessBlock as u8])
-                    .unwrap();
+                    .map_err(DataIn)?;
 
                 if let Some(code) = page_code {
                     let mut out = vec![];
@@ -284,13 +339,14 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                             out.push(0b0000_0010); // thin provisioned
                             out.push(0); // no threshold % support
                         }
-                        _ => return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB),
+                        _ => return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB)),
                     }
-                    data_in.write_all(&[code.into()]).unwrap();
+                    data_in.write_all(&[code.into()]).map_err(DataIn)?;
+                    // unwrap is fine: none of our VPD pages are over 2^16 bits long
                     data_in
                         .write_all(&u16::try_from(out.len()).unwrap().to_be_bytes())
-                        .unwrap();
-                    data_in.write_all(&out).unwrap();
+                        .map_err(DataIn)?;
+                    data_in.write_all(&out).map_err(DataIn)?;
                 } else {
                     data_in
                         .write_all(&[
@@ -304,111 +360,121 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                             0,           // more things we don't have
                             0b0000_0010, // support command queueing
                         ])
-                        .unwrap();
+                        .map_err(DataIn)?;
 
                     // TODO: register this or another name with T10
                     // incidentally, QEMU hasn't been registered - they should do that
-                    data_in.write_all(b"rust-vmm").unwrap();
-                    data_in.write_all(b"vhost-user-scsi ").unwrap();
-                    data_in.write_all(b"v0  ").unwrap();
+                    data_in.write_all(b"rust-vmm").map_err(DataIn)?;
+                    data_in.write_all(b"vhost-user-scsi ").map_err(DataIn)?;
+                    data_in.write_all(b"v0  ").map_err(DataIn)?;
                     // fwiw, the Linux kernel doesn't request any more than this.
                     // no idea if anyone else does.
-                    data_in.write_all(&[0; 22]).unwrap();
+                    data_in.write_all(&[0; 22]).map_err(DataIn)?;
 
                     // TODO: are we getting these right? does anyone care?
                     let product_descs: &[u16; 8] = &[0xc0, 0x05c0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
 
                     for desc in product_descs {
-                        data_in.write_all(&desc.to_be_bytes()).unwrap();
+                        data_in.write_all(&desc.to_be_bytes()).map_err(DataIn)?;
                     }
 
-                    data_in.write_all(&[0; 22]).unwrap();
+                    data_in.write_all(&[0; 22]).map_err(DataIn)?;
                 }
 
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
             Command::ReportSupportedOperationCodes { rctd, mode } => {
-                fn one_command_supported(data_in: &mut impl Write, ty: CommandType) {
-                    data_in.write_all(&[0]).unwrap(); // unused flags
-                                                      // supported, don't set a bunch of flags
-                    data_in.write_all(&[0b0000_0011]).unwrap();
+                fn one_command_supported(
+                    data_in: &mut impl Write,
+                    ty: CommandType,
+                ) -> io::Result<()> {
+                    data_in.write_all(&[0])?; // unused flags
+                    data_in.write_all(&[0b0000_0011])?; // supported, don't set a bunch of flags
                     let tpl = ty.cdb_template();
-                    data_in
-                        .write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())
-                        .unwrap();
-                    data_in.write_all(tpl).unwrap();
+                    // unwrap is safe: the length of the template is the length of the CDB, and no
+                    // command we support is anywhere near that long
+                    data_in.write_all(&u16::try_from(tpl.len()).unwrap().to_be_bytes())?;
+                    data_in.write_all(tpl)?;
+                    Ok(())
                 }
-                fn one_command_not_supported(data_in: &mut impl Write) {
-                    data_in.write_all(&[0]).unwrap(); // unused flags
-                    data_in.write_all(&[0b0000_0001]).unwrap(); // not supported
-                    data_in.write_all(&[0; 2]).unwrap(); // cdb len
+                fn one_command_not_supported(data_in: &mut impl Write) -> io::Result<()> {
+                    data_in.write_all(&[0])?; // unused flags
+                    data_in.write_all(&[0b0000_0001])?; // not supported
+                    data_in.write_all(&[0; 2])?; // cdb len
+                    Ok(())
                 }
-                fn timeout_descriptor(data_in: &mut impl Write) {
+                fn timeout_descriptor(data_in: &mut impl Write) -> io::Result<()> {
                     // timeout descriptor
-                    data_in.write_all(&0xa_u16.to_be_bytes()).unwrap(); // len
-                    data_in.write_all(&[0, 0]).unwrap(); // reserved, cmd specific
-                    data_in.write_all(&0_u32.to_be_bytes()).unwrap();
-                    data_in.write_all(&0_u32.to_be_bytes()).unwrap();
+                    data_in.write_all(&0xa_u16.to_be_bytes())?; // len
+                    data_in.write_all(&[0, 0])?; // reserved, cmd specific
+                    data_in.write_all(&0_u32.to_be_bytes())?;
+                    data_in.write_all(&0_u32.to_be_bytes())?;
+                    Ok(())
                 }
                 match mode {
                     ReportSupportedOpCodesMode::All => {
                         let cmd_len = if rctd { 20 } else { 8 };
+                        // unwrap is safe: we're never going to have (2^32 / 20) ~= 2^27 opcodes
                         let len = u32::try_from(OPCODES.len() * cmd_len).unwrap();
-                        data_in.write_all(&len.to_be_bytes()).unwrap();
+                        data_in.write_all(&len.to_be_bytes()).map_err(DataIn)?;
                         for &(ty, (opcode, sa)) in OPCODES {
-                            data_in.write_all(&[opcode]).unwrap();
-                            data_in.write_all(&[0]).unwrap(); // reserved
-                            data_in.write_all(&sa.unwrap_or(0).to_be_bytes()).unwrap();
-                            data_in.write_all(&[0]).unwrap(); // reserved
+                            data_in.write_all(&[opcode]).map_err(DataIn)?;
+                            data_in.write_all(&[0]).map_err(DataIn)?; // reserved
+                            data_in
+                                .write_all(&sa.unwrap_or(0).to_be_bytes())
+                                .map_err(DataIn)?;
+                            data_in.write_all(&[0]).map_err(DataIn)?; // reserved
 
                             let ctdp: u8 = if rctd { 0b10 } else { 0b00 };
                             let servactv: u8 = if sa.is_some() { 0b1 } else { 0b0 };
-                            data_in.write_all(&[ctdp | servactv]).unwrap();
+                            data_in.write_all(&[ctdp | servactv]).map_err(DataIn)?;
 
+                            // unwrap is safe: cdb template len is cdb len, and those are much
+                            // shorter than a u16
                             data_in
                                 .write_all(
                                     &u16::try_from(ty.cdb_template().len())
                                         .unwrap()
                                         .to_be_bytes(),
                                 )
-                                .unwrap();
+                                .map_err(DataIn)?;
 
                             if rctd {
-                                timeout_descriptor(&mut data_in);
+                                timeout_descriptor(&mut data_in).map_err(DataIn)?;
                             }
                         }
                     }
                     ReportSupportedOpCodesMode::OneCommand(opcode) => match parse_opcode(opcode) {
                         ParseOpcodeResult::Command(ty) => {
-                            one_command_supported(&mut data_in, ty);
+                            one_command_supported(&mut data_in, ty).map_err(DataIn)?;
 
                             if rctd {
-                                timeout_descriptor(&mut data_in);
+                                timeout_descriptor(&mut data_in).map_err(DataIn)?;
                             }
                         }
                         ParseOpcodeResult::ServiceAction(_) => {
-                            return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB);
+                            return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
                         }
                         ParseOpcodeResult::Invalid => {
                             warn!("Reporting that we don't support command {:#2x}. It might be worth adding.", opcode);
-                            one_command_not_supported(&mut data_in);
+                            one_command_not_supported(&mut data_in).map_err(DataIn)?;
                         }
                     },
                     ReportSupportedOpCodesMode::OneServiceAction(opcode, sa) => {
                         match parse_opcode(opcode) {
                             ParseOpcodeResult::Command(_) => {
-                                return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB)
+                                return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB))
                             }
                             ParseOpcodeResult::ServiceAction(unparsed_sa) => {
                                 if let Some(ty) = unparsed_sa.parse(sa) {
-                                    one_command_supported(&mut data_in, ty);
+                                    one_command_supported(&mut data_in, ty).map_err(DataIn)?;
 
                                     if rctd {
-                                        timeout_descriptor(&mut data_in);
+                                        timeout_descriptor(&mut data_in).map_err(DataIn)?;
                                     }
                                 } else {
                                     warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
-                                    one_command_not_supported(&mut data_in);
+                                    one_command_not_supported(&mut data_in).map_err(DataIn)?;
                                 }
                             }
                             ParseOpcodeResult::Invalid => {
@@ -417,7 +483,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                                 // "does not implement service actions", so we say invalid field in
                                 // CDB
                                 warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
-                                return CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB);
+                                return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
                             }
                         }
                     }
@@ -425,35 +491,35 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         match parse_opcode(opcode) {
                             ParseOpcodeResult::Command(ty) => {
                                 if sa == 0 {
-                                    one_command_supported(&mut data_in, ty);
+                                    one_command_supported(&mut data_in, ty).map_err(DataIn)?;
 
                                     if rctd {
-                                        timeout_descriptor(&mut data_in);
+                                        timeout_descriptor(&mut data_in).map_err(DataIn)?;
                                     }
                                 } else {
-                                    one_command_not_supported(&mut data_in);
+                                    one_command_not_supported(&mut data_in).map_err(DataIn)?;
                                 }
                             }
                             ParseOpcodeResult::ServiceAction(unparsed_sa) => {
                                 if let Some(ty) = unparsed_sa.parse(sa) {
-                                    one_command_supported(&mut data_in, ty);
+                                    one_command_supported(&mut data_in, ty).map_err(DataIn)?;
 
                                     if rctd {
-                                        timeout_descriptor(&mut data_in);
+                                        timeout_descriptor(&mut data_in).map_err(DataIn)?;
                                     }
                                 } else {
                                     warn!("Reporting that we don't support command {:#2x}/{:#2x}. It might be worth adding.", opcode, sa);
-                                    one_command_not_supported(&mut data_in);
+                                    one_command_not_supported(&mut data_in).map_err(DataIn)?;
                                 }
                             }
                             ParseOpcodeResult::Invalid => {
                                 warn!("Reporting that we don't support command {:#2x}[/{:#2x}]. It might be worth adding.", opcode, sa);
-                                one_command_not_supported(&mut data_in);
+                                one_command_not_supported(&mut data_in).map_err(DataIn)?;
                             }
                         }
                     }
                 }
-                CmdOutput::ok()
+                Ok(CmdOutput::ok())
             }
         }
     }

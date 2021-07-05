@@ -12,12 +12,12 @@ mod scsi;
 
 use std::{
     convert::TryInto,
-    io::Read,
+    io::{ErrorKind, Read},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-use log::info;
+use log::{error, info};
 use structopt::StructOpt;
 use vhost::vhost_user::{
     message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
@@ -29,21 +29,21 @@ use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
 use crate::{
-    scsi::{block_device::BlockDevice, EmulatedTarget, TaskAttr},
+    scsi::{block_device::BlockDevice, CmdError, EmulatedTarget, TaskAttr},
     virtio::{Response, VirtioScsiResponse},
 };
 
-const CDB_SIZE: usize = 32; // TODO: default; can change
-const SENSE_SIZE: usize = 96; // TODO: default; can change
+// These are the defaults given in the virtio spec; QEMU doesn't let the driver
+// write to config space, so these will always be the correct values.
+const CDB_SIZE: usize = 32;
+const SENSE_SIZE: usize = 96;
 
-// XXX: this type is ridiculous; can we make it less so?
 type DescriptorChainWriter = virtio::DescriptorChainWriter<GuestMemoryAtomic<GuestMemoryMmap>>;
 type DescriptorChainReader = virtio::DescriptorChainReader<GuestMemoryAtomic<GuestMemoryMmap>>;
 type Target = dyn scsi::Target<DescriptorChainWriter, DescriptorChainReader>;
 
 struct VhostUserScsiBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    // image: Mutex<BlockDevice>,
     targets: Vec<Box<Target>>,
 }
 
@@ -51,7 +51,6 @@ impl VhostUserScsiBackend {
     fn new() -> Self {
         Self {
             mem: None,
-            // image: Mutex::new(image),
             targets: Vec::new(),
         }
     }
@@ -118,17 +117,53 @@ impl VhostUserScsiBackend {
                 },
             );
 
-            println!("Command result: {:?}", output.status);
+            match output {
+                Ok(output) => {
+                    println!("Command result: {:?}", output.status);
 
-            assert!(output.sense.len() < SENSE_SIZE);
+                    assert!(output.sense.len() < SENSE_SIZE);
 
-            Response {
-                response: VirtioScsiResponse::Ok,
-                status: output.status,
-                status_qualifier: output.status_qualifier,
-                sense: output.sense,
-                // TODO: handle residual for data in
-                residual: body_writer.residual(),
+                    Response {
+                        response: VirtioScsiResponse::Ok,
+                        status: output.status,
+                        status_qualifier: output.status_qualifier,
+                        sense: output.sense,
+                        // TODO: handle residual for data in
+                        residual: body_writer.residual(),
+                    }
+                }
+                Err(CmdError::CdbTooShort) => {
+                    // the CDB buffer is statically sized larger than any CDB we support; we don't
+                    // handle writes to config space, so there's no way the guest can set it too
+                    // small
+                    unreachable!();
+                }
+                Err(CmdError::DataIn(e)) => {
+                    if e.kind() == ErrorKind::WriteZero {
+                        Response {
+                            response: VirtioScsiResponse::Overrun,
+                            status: 0,
+                            status_qualifier: 0,
+                            sense: Vec::new(),
+                            residual: 0,
+                        }
+                    } else {
+                        // Alright, so something went wrong writing our response
+                        // to guest memory. The only reason this should ever
+                        // happen, I think, is if the guest gave us a virtio descriptor with an
+                        // invalid address.
+
+                        // There's not a great way to recover from this - we just discovered that
+                        // our only way of communicating with the guest doesn't work - so we either
+                        // silently fail or crash. There isn't too much sense in crashing, IMO, as
+                        // the guest could still recover by, say, installing a fixed kernel and
+                        // rebooting. So let's just log an error and do nothing.
+
+                        error!("Error writing response to guest memory: {}", e);
+
+                        return;
+                    }
+                }
             }
         } else {
             println!("Rejecting command to {:?}", lun);
@@ -170,13 +205,11 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         VhostUserProtocolFeatures::MQ
-        // | VhostUserProtocolFeatures::REPLY_ACK
-        // | VhostUserProtocolFeatures::SLAVE_REQ
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
-        assert!(!enabled) // should always be true until we support EVENT_IDX in
-                          // features
+        // Should always be true until we support EVENT_IDX in features.
+        assert!(!enabled)
     }
 
     fn update_memory(
@@ -195,8 +228,6 @@ impl VhostUserBackend for VhostUserScsiBackend {
         vrings: &[Arc<RwLock<vhost_user_backend::Vring>>],
         thread_id: usize,
     ) -> std::result::Result<bool, std::io::Error> {
-        // println!("handle_event: {}", device_event);
-
         hope!(evset == epoll::Events::EPOLLIN); // TODO: virtiofsd returns an error on this
         hope!(vrings.len() == 3);
         hope!(thread_id == 0);
@@ -205,37 +236,26 @@ impl VhostUserBackend for VhostUserScsiBackend {
         let mut vring = vrings[device_event as usize].write().unwrap();
         let queue = vring.mut_queue();
 
-        let mut used = Vec::new();
+        let chains: Vec<_> = queue.iter().unwrap().collect();
 
-        for dc in queue.iter().unwrap() {
+        for dc in chains {
             let mut writer = DescriptorChainWriter::new(dc.clone());
             let mut reader = DescriptorChainReader::new(dc.clone());
+
             match device_event {
-                0 => self.handle_control_queue(&mut reader, &mut writer),
-                2 => {
-                    // let mut img = self.image.lock().unwrap();
-                    self.handle_request_queue(&mut reader, &mut writer)
-                }
-                _ => todo!(),
+                2 => self.handle_request_queue(&mut reader, &mut writer),
+                _ => warn!("Ignoring descriptor  "),
             }
 
-            used.push((dc.head_index(), writer.max_written()))
-        }
-
-        for (hi, len) in used {
-            queue.add_used(hi, len).unwrap();
+            queue
+                .add_used(dc.head_index(), writer.max_written())
+                .unwrap()
         }
 
         vring.signal_used_queue().unwrap();
 
-        // todo!()
-
         Ok(false) // TODO: what's this bool? no idea. virtiofd-rs returns false
     }
-
-    // fn acked_features(&mut self, features: u64) {
-    //     dbg!(features);
-    // }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
         // QEMU handles config space itself
@@ -287,7 +307,7 @@ fn main() {
     let mut target = EmulatedTarget::new();
 
     for image in opt.images {
-        let mut dev = BlockDevice::new(&image).expect("opening image");
+        let mut dev = BlockDevice::new(&image).expect("Opening image");
         dev.set_write_protected(opt.read_only);
         dev.set_solid_state(opt.solid_state);
         target.add_lun(Box::new(dev));
@@ -299,8 +319,8 @@ fn main() {
         .expect("Creating daemon");
 
     daemon
-        .start(Listener::new(opt.sock, true).expect("listener"))
-        .expect("starting daemon");
+        .start(Listener::new(opt.sock, true).expect("Creating listener"))
+        .expect("Starting daemon");
 
-    daemon.wait().expect("waiting");
+    daemon.wait().expect("Running daemon");
 }

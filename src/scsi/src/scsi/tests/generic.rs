@@ -1,12 +1,15 @@
-use std::path::Path;
+use std::{io::ErrorKind, path::Path};
 
 use super::do_command_fail;
-use crate::scsi::{block_device::BlockDevice, sense, EmulatedTarget};
+use crate::scsi::{
+    block_device::BlockDevice, sense, CmdError, CmdOutput, EmulatedTarget, Request, Target,
+    TaskAttr,
+};
 
 #[test]
 fn test_invalid_opcode() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     do_command_fail(
@@ -22,7 +25,7 @@ fn test_invalid_opcode() {
 #[test]
 fn test_invalid_service_action() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     do_command_fail(
@@ -34,4 +37,39 @@ fn test_invalid_service_action() {
         ],
         sense::INVALID_FIELD_IN_CDB,
     );
+}
+
+fn test_short_data_out_buffer() {
+    let mut target: EmulatedTarget<&mut [u8], &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
+    target.add_lun(Box::new(dev));
+
+    let mut data_in: &mut [u8] = &mut [];
+    let mut data_out: &[u8] = &[0; 511];
+
+    let res = target.execute_command(
+        0,
+        Request {
+            id: 0,
+            cdb: &[
+                0x28, // READ (10)
+                0,    // flags
+                0, 0, 0, 15, // LBA: 5
+                0,  // reserved, group #
+                0, 1, // transfer length: 1
+                0, // control
+            ],
+            task_attr: TaskAttr::Simple,
+            data_in: &mut data_in,
+            data_out: &mut data_out,
+            crn: 0,
+            prio: 0,
+        },
+    );
+
+    if let CmdError::DataIn(e) = res.unwrap_err() {
+        assert_eq!(e.kind(), ErrorKind::WriteZero)
+    } else {
+        panic!();
+    }
 }

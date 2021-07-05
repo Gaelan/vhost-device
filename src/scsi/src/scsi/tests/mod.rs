@@ -1,7 +1,7 @@
 #![cfg(test)]
 
-mod report_supported_operation_codes;
 mod generic;
+mod report_supported_operation_codes;
 
 use std::path::Path;
 
@@ -29,7 +29,7 @@ fn do_command_in(target: &mut EmulatedTarget<Vec<u8>, &[u8]>, cdb: &[u8], expect
         },
     );
 
-    assert_eq!(res, CmdOutput::ok());
+    assert_eq!(res.unwrap(), CmdOutput::ok());
     assert_eq!(&data_in, expected_data_in);
 }
 
@@ -54,7 +54,7 @@ fn do_command_fail(
         },
     );
 
-    assert_eq!(res, CmdOutput::check_condition(expected_error));
+    assert_eq!(res.unwrap(), CmdOutput::check_condition(expected_error));
     assert_eq!(&data_in, &[]);
 }
 
@@ -100,7 +100,7 @@ fn test_report_luns() {
 #[test]
 fn test_read_10() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -123,7 +123,7 @@ fn test_read_10() {
 #[test]
 fn test_read_10_last_block() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -146,7 +146,7 @@ fn test_read_10_last_block() {
 #[test]
 fn test_read_10_out_of_range() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -169,7 +169,7 @@ fn test_read_10_out_of_range() {
 #[test]
 fn test_read_10_cross_out() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -192,7 +192,7 @@ fn test_read_10_cross_out() {
 #[test]
 fn test_read_capacity_10() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -218,7 +218,7 @@ fn test_read_capacity_10() {
 #[test]
 fn test_read_capacity_16() {
     let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
-    let dev = BlockDevice::new(Path::new("src/scsi/test.img")).unwrap();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
     target.add_lun(Box::new(dev));
 
     // TODO: this test relies on the default logical block size of 512. We should
@@ -230,7 +230,7 @@ fn test_read_capacity_16() {
             0x9e, 0x10, // READ CAPACITY (16)
             0, 0, 0, 0, 0, 0, 0, 0, // obsolete
             0, 0, 0, 32, // allocation length: 32
-            0, // obselete/reserved
+            0,  // obselete/reserved
             0,  // control
         ],
         &[
@@ -244,4 +244,3 @@ fn test_read_capacity_16() {
         ],
     );
 }
-
