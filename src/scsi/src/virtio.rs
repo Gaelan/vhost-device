@@ -21,10 +21,6 @@ pub enum VirtioScsiLun {
 
 impl VirtioScsiLun {
     pub fn parse(bytes: [u8; 8]) -> Option<Self> {
-        // println!(
-        //     "LUN: {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
-        //     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-        // bytes[7] );
         if bytes == [0xc1, 0x01, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0] {
             Some(Self::ReportLuns)
         } else if bytes[0] == 0x1 {
@@ -165,7 +161,6 @@ impl<M: GuestAddressSpace + Clone> DescriptorChainWriter<M> {
 
 impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // dbg!(self.current, self.offset, buf.len());
         if let Some(current) = self.current {
             let left_in_descriptor = current.len() - self.offset;
             let to_write: u32 = min(left_in_descriptor, buf.len() as u32);
@@ -178,8 +173,6 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
                     GuestAddress(current.addr().0 + u64::from(self.offset)),
                 )
                 .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-
-            // dbg!(to_write, written);
 
             self.offset += written as u32;
 

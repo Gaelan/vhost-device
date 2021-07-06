@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use log::warn;
+use log::{debug, error, warn};
 use CmdError::DataIn;
 
 use super::{CmdError, EmulatedTarget};
@@ -54,10 +54,10 @@ impl BlockDevice {
         Ok(ret)
     }
 
-    pub fn size_in_blocks(&self) -> u64 {
-        let len = self.file.metadata().unwrap().len();
+    pub fn size_in_blocks(&self) -> io::Result<u64> {
+        let len = self.file.metadata()?.len();
         assert!(len % u64::from(self.block_size) == 0);
-        len / u64::from(self.block_size)
+        Ok(len / u64::from(self.block_size))
     }
 
     pub const fn block_size(&self) -> u32 {
@@ -76,7 +76,7 @@ impl BlockDevice {
 impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
     // TODO: would this be more readable split into functions? I lean towards
     // thinking it just adds boilderplate, but not sure
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn execute_command(
         &self,
         req: Request<'_, W, R>,
@@ -122,23 +122,14 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
             cdb.allocation_length.map_or(usize::MAX, |x| x as usize),
         );
 
-        println!("Incoming command: {:?}", &cdb);
-
-        // style note: throughout this code, we use u{8,16,32,16}::to_be_bytes(foo)
-        // instead of foo.to_be_bytes(). This allows us to see the layout of our
-        // response in one place, instead of having to go hunting for where foo is
-        // declared to determine its size.
-        // exception: when the size occurs earlier in the same line, e.g.
-        // u64::from(foo).to_be_bytes()
-
-        // TODO: make that true
+        debug!("Incoming command: {:?}", &cdb);
 
         match cdb.command {
             Command::TestUnitReady => Ok(CmdOutput::ok()),
             Command::ReportLuns(select_report) => {
                 fn encode_lun(lun: u16) -> [u8; 8] {
-                    // TODO: actually understand the LUN format, esp for luns over 256
-                    hope!(lun < 256);
+                    // TODO: Support LUNs over 256
+                    assert!(lun < 256);
                     [0, lun.try_into().unwrap(), 0, 0, 0, 0, 0, 0]
                 }
                 let luns = target.luns().map(encode_lun);
@@ -158,47 +149,64 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 Ok(CmdOutput::ok())
             }
             Command::ReadCapacity10 => {
-                // READ CAPACITY (10) returns a 32-bit LBA, which may not be enough. If it
-                // isn't, we're supposed to return 0xffff_ffff and hope the driver gets the memo
-                // and uses the newer READ CAPACITY (16).
-                // n.b. this is the last block, ie (length-1), not length
-                let final_block: u32 = (self.size_in_blocks() - 1)
-                    .try_into()
-                    .unwrap_or(0xffff_ffff);
-                let block_size: u32 = self.block_size();
+                match self.size_in_blocks() {
+                    Ok(size) => {
+                        // READ CAPACITY (10) returns a 32-bit LBA, which may not be enough. If it
+                        // isn't, we're supposed to return 0xffff_ffff and hope the driver gets the
+                        // memo and uses the newer READ CAPACITY (16).
 
-                data_in
-                    .write_all(&u32::to_be_bytes(final_block))
-                    .map_err(DataIn)?;
-                data_in
-                    .write_all(&u32::to_be_bytes(block_size))
-                    .map_err(DataIn)?;
+                        // n.b. this is the last block, ie (length-1), not length
+                        let final_block: u32 = (size - 1).try_into().unwrap_or(0xffff_ffff);
+                        let block_size: u32 = self.block_size();
 
-                Ok(CmdOutput::ok())
+                        data_in
+                            .write_all(&u32::to_be_bytes(final_block))
+                            .map_err(DataIn)?;
+                        data_in
+                            .write_all(&u32::to_be_bytes(block_size))
+                            .map_err(DataIn)?;
+
+                        Ok(CmdOutput::ok())
+                    }
+                    Err(e) => {
+                        error!("Error getting image size: {}", e);
+                        // TODO: Is this a reasonable sense code to send?
+                        Ok(CmdOutput::check_condition(sense::UNRECOVERED_READ_ERROR))
+                    }
+                }
             }
             Command::ReadCapacity16 => {
-                // n.b. this is the last block, ie (length-1), not length
-                let final_block: u64 = self.size_in_blocks() - 1;
-                let block_size: u32 = self.block_size();
+                match self.size_in_blocks() {
+                    Ok(size) => {
+                        // n.b. this is the last block, ie (length-1), not length
+                        let final_block: u64 = size - 1;
+                        let block_size: u32 = self.block_size();
 
-                data_in
-                    .write_all(&u64::to_be_bytes(final_block))
-                    .map_err(DataIn)?;
-                data_in
-                    .write_all(&u32::to_be_bytes(block_size))
-                    .map_err(DataIn)?;
+                        data_in
+                            .write_all(&u64::to_be_bytes(final_block))
+                            .map_err(DataIn)?;
+                        data_in
+                            .write_all(&u32::to_be_bytes(block_size))
+                            .map_err(DataIn)?;
 
-                // no protection stuff; 1-to-1 logical/physical blocks
-                data_in.write_all(&[0, 0]).map_err(DataIn)?;
+                        // no protection stuff; 1-to-1 logical/physical blocks
+                        data_in.write_all(&[0, 0]).map_err(DataIn)?;
 
-                // top 2 bits: thin provisioning stuff; other 14 bits are lowest
-                // aligned LBA, which is zero
-                data_in.write_all(&[0b1100_0000, 0]).map_err(DataIn)?;
+                        // top 2 bits: thin provisioning stuff; other 14 bits are lowest
+                        // aligned LBA, which is zero
+                        data_in.write_all(&[0b1100_0000, 0]).map_err(DataIn)?;
 
-                // reserved
-                data_in.write_all(&[0; 16]).map_err(DataIn)?;
+                        // reserved
+                        data_in.write_all(&[0; 16]).map_err(DataIn)?;
 
-                Ok(CmdOutput::ok())
+                        Ok(CmdOutput::ok())
+                    }
+                    Err(e) => {
+                        error!("Error getting image size: {}", e);
+                        // TODO: Is this a reasonable sense code to send?
+                        Ok(CmdOutput::check_condition(sense::UNRECOVERED_READ_ERROR))
+                    }
+                }
             }
             Command::ModeSense6 { mode_page, pc, dbd } => {
                 hope!(pc == ModeSensePageControl::Current);
@@ -233,21 +241,16 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         pages_len + 3, // size in bytes after this one
                         0,             // medium type - 0 for SBC
                         if self.write_protected {
-                            0b1001_0000 // support WP and DPOFUA
+                            0b1001_0000 // WP, support DPOFUA
                         } else {
-                            0b0000_0000
+                            0b0001_0000 // support DPOFUA
                         },
                         0, // block desc length
                     ])
                     .map_err(DataIn)?;
 
-                // TODO: block descriptors are optional. does anyone care?
-
-                // // block descriptos
-                // // TODO: dynamic size
-                // data_in.write_all(&0x1_0000_u32.to_be_bytes()).unwrap();
-                // // top byte reserved
-                // data_in.write_all(&512_u32.to_be_bytes()).unwrap();
+                // TODO: Block descriptors are optional, so we currently don't provide them.
+                // Does any driver actually use them?
 
                 for page in pages {
                     page.write(&mut data_in);
@@ -284,28 +287,45 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     // return has been saved to disk. fsync()ing the whole image
                     // is a bit blunt, but does the trick.
 
-                    self.file.sync_all().unwrap();
+                    if let Err(e) = self.file.sync_all() {
+                        // TODO: I'm not sure how best to report this failure to the guest. For now,
+                        // we don't support writes, so it's unlikely fsync() will ever error; even
+                        // if it somehow does, we won't have any unflushed writes, so ignoring the
+                        // error should be fine; the contents we're reading back should always match
+                        // what's on disk.
+                        error!("Error syncing file: {}", e);
+                    }
                 }
                 hope!(group_number == 0);
 
-                if u64::from(lba) + u64::from(transfer_length) > self.size_in_blocks() {
+                let size = match self.size_in_blocks() {
+                    Ok(size) => size,
+                    Err(e) => {
+                        error!("Error getting image size for read: {}", e);
+                        return Ok(CmdOutput::check_condition(sense::UNRECOVERED_READ_ERROR));
+                    }
+                };
+
+                if u64::from(lba) + u64::from(transfer_length) > size {
                     return Ok(CmdOutput::check_condition(
                         sense::LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
                     ));
                 }
 
-                let bytes = self
-                    .read_blocks(u64::from(lba), u64::from(transfer_length))
-                    .unwrap();
+                let read_result = self.read_blocks(u64::from(lba), u64::from(transfer_length));
 
-                data_in.write_all(&bytes[..]).map_err(DataIn)?;
-
-                Ok(CmdOutput::ok())
+                match read_result {
+                    Ok(bytes) => {
+                        data_in.write_all(&bytes[..]).map_err(DataIn)?;
+                        Ok(CmdOutput::ok())
+                    }
+                    Err(e) => {
+                        error!("Error reading image: {}", e);
+                        Ok(CmdOutput::check_condition(sense::UNRECOVERED_READ_ERROR))
+                    }
+                }
             }
             Command::Inquiry(page_code) => {
-                // TODO: we should also be responding to INQUIRies to bad LUNs, but
-                // right now we terminate those before here
-
                 // top bits 0: peripheral device code = exists and ready
                 data_in
                     .write_all(&[DeviceType::DirectAccessBlock as u8])
@@ -315,7 +335,6 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     let mut out = vec![];
                     match code {
                         VpdPage::SupportedVpdPages => {
-                            // TODO: do we want to support other pages?
                             out.push(VpdPage::SupportedVpdPages.into());
                             out.push(VpdPage::BlockDeviceCharacteristics.into());
                             out.push(VpdPage::LogicalBlockProvisioning.into());
@@ -363,16 +382,21 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         .map_err(DataIn)?;
 
                     // TODO: register this or another name with T10
-                    // incidentally, QEMU hasn't been registered - they should do that
                     data_in.write_all(b"rust-vmm").map_err(DataIn)?;
                     data_in.write_all(b"vhost-user-scsi ").map_err(DataIn)?;
                     data_in.write_all(b"v0  ").map_err(DataIn)?;
-                    // fwiw, the Linux kernel doesn't request any more than this.
-                    // no idea if anyone else does.
+
+                    // The Linux kernel doesn't request any more than this, so any data we return
+                    // after this point is mostly academic.
+
                     data_in.write_all(&[0; 22]).map_err(DataIn)?;
 
-                    // TODO: are we getting these right? does anyone care?
-                    let product_descs: &[u16; 8] = &[0xc0, 0x05c0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+                    let product_descs: &[u16; 8] = &[
+                        0xc0,   // SAM-6 (no version claimed)
+                        0x05c0, // SPC-5 (no version claimed)
+                        0x0600, // SBC-4 (no version claimed)
+                        0x0, 0x0, 0x0, 0x0, 0x0,
+                    ];
 
                     for desc in product_descs {
                         data_in.write_all(&desc.to_be_bytes()).map_err(DataIn)?;
@@ -384,6 +408,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 Ok(CmdOutput::ok())
             }
             Command::ReportSupportedOperationCodes { rctd, mode } => {
+                // helpers for output data format
                 fn one_command_supported(
                     data_in: &mut impl Write,
                     ty: CommandType,
@@ -411,6 +436,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     data_in.write_all(&0_u32.to_be_bytes())?;
                     Ok(())
                 }
+
                 match mode {
                     ReportSupportedOpCodesMode::All => {
                         let cmd_len = if rctd { 20 } else { 8 };

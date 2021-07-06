@@ -14,10 +14,11 @@ use std::{
     convert::TryInto,
     io::{ErrorKind, Read},
     path::PathBuf,
+    process::exit,
     sync::{Arc, RwLock},
 };
 
-use log::{error, info};
+use log::{debug, error, info, warn};
 use structopt::StructOpt;
 use vhost::vhost_user::{
     message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
@@ -27,6 +28,7 @@ use vhost_user_backend::{VhostUserBackend, VhostUserDaemon};
 use virtio::VirtioScsiLun;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 use crate::{
     scsi::{block_device::BlockDevice, CmdError, EmulatedTarget, TaskAttr},
@@ -45,6 +47,7 @@ type Target = dyn scsi::Target<DescriptorChainWriter, DescriptorChainReader>;
 struct VhostUserScsiBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     targets: Vec<Box<Target>>,
+    exit_event: EventFd,
 }
 
 impl VhostUserScsiBackend {
@@ -52,20 +55,12 @@ impl VhostUserScsiBackend {
         Self {
             mem: None,
             targets: Vec::new(),
+            exit_event: EventFd::new(EFD_NONBLOCK).expect("Creating exit eventfd"),
         }
     }
 }
 
 impl VhostUserScsiBackend {
-    fn handle_control_queue(
-        &self,
-        reader: &mut DescriptorChainReader,
-        writer: &mut DescriptorChainWriter,
-    ) {
-        // dbg!(buf[0]);
-        todo!();
-    }
-
     fn parse_target(&self, lun: VirtioScsiLun) -> Option<(&Target, u16)> {
         match lun {
             VirtioScsiLun::TargetLun(target, lun) => self
@@ -119,8 +114,6 @@ impl VhostUserScsiBackend {
 
             match output {
                 Ok(output) => {
-                    println!("Command result: {:?}", output.status);
-
                     assert!(output.sense.len() < SENSE_SIZE);
 
                     Response {
@@ -134,8 +127,8 @@ impl VhostUserScsiBackend {
                 }
                 Err(CmdError::CdbTooShort) => {
                     // the CDB buffer is statically sized larger than any CDB we support; we don't
-                    // handle writes to config space, so there's no way the guest can set it too
-                    // small
+                    // handle writes to config space (because QEMU doesn't let us), so there's no
+                    // way the guest can set it too small
                     unreachable!();
                 }
                 Err(CmdError::DataIn(e)) => {
@@ -166,7 +159,7 @@ impl VhostUserScsiBackend {
                 }
             }
         } else {
-            println!("Rejecting command to {:?}", lun);
+            debug!("Rejecting command to LUN with bad target {:?}", lun);
             Response {
                 response: VirtioScsiResponse::BadTarget,
                 status: 0,
@@ -175,9 +168,6 @@ impl VhostUserScsiBackend {
                 residual: body_writer.residual(),
             }
         };
-
-        // dbg!(body_writer.written);
-        // hope!(body_writer.done());
 
         response.write(writer).unwrap();
     }
@@ -233,18 +223,25 @@ impl VhostUserBackend for VhostUserScsiBackend {
         hope!(thread_id == 0);
 
         hope!((device_event as usize) < vrings.len());
+        // unwrap: only fails if the lock is poisoned, in which case we already panicked
+        // somewhere else
         let mut vring = vrings[device_event as usize].write().unwrap();
         let queue = vring.mut_queue();
 
         let chains: Vec<_> = queue.iter().unwrap().collect();
 
         for dc in chains {
+            dbg!(device_event, dc.clone().collect::<Vec<_>>());
             let mut writer = DescriptorChainWriter::new(dc.clone());
             let mut reader = DescriptorChainReader::new(dc.clone());
 
+            #[allow(clippy::single_match_else)]
             match device_event {
                 2 => self.handle_request_queue(&mut reader, &mut writer),
-                _ => warn!("Ignoring descriptor  "),
+                _ => {
+                    error!("Ignoring descriptor on queue {}", device_event);
+                    continue;
+                }
             }
 
             queue
@@ -267,14 +264,12 @@ impl VhostUserBackend for VhostUserScsiBackend {
         panic!("Access to configuration space is not supported.");
     }
 
-    // fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)>
-    // {     dbg!();
-    //     // let fd = EventFd::new(EFD_NONBLOCK).unwrap();
-    //     // let ret = Some((fd.try_clone().unwrap(), Some(3)));
-    //     // mem::forget(fd);
-    //     // ret
-    //     None
-    // }
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)> {
+        Some((
+            self.exit_event.try_clone().expect("Cloning exit eventfd"),
+            None,
+        ))
+    }
 }
 
 #[derive(StructOpt, Debug)]
@@ -306,6 +301,13 @@ fn main() {
     let mut backend = VhostUserScsiBackend::new();
     let mut target = EmulatedTarget::new();
 
+    if opt.images.len() > 256 {
+        error!("More than 256 LUNs aren't currently supported.");
+        // This is fairly simple to add; it's just a matter of supporting the right LUN
+        // encoding formats.
+        exit(1);
+    }
+
     for image in opt.images {
         let mut dev = BlockDevice::new(&image).expect("Opening image");
         dev.set_write_protected(opt.read_only);
@@ -323,4 +325,6 @@ fn main() {
         .expect("Starting daemon");
 
     daemon.wait().expect("Running daemon");
+
+    dbg!();
 }

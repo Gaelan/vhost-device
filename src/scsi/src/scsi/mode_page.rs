@@ -18,7 +18,11 @@ impl ModePage {
         }
     }
     pub fn write(self, data_in: &mut impl Write) {
-        hope!(self.page_code().1 == 0); // not a subpage
+        assert_eq!(
+            self.page_code().1,
+            0,
+            "Subpages aren't supported yet."
+        );
 
         data_in
             .write_all(&[

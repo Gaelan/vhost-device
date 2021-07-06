@@ -18,6 +18,11 @@ impl SenseTriple {
     }
 }
 
-pub const INVALID_COMMAND_OPERATION_CODE: SenseTriple = SenseTriple(0x5, 0x20, 0x0);
-pub const LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE: SenseTriple = SenseTriple(0x5, 0x21, 0x0);
-pub const INVALID_FIELD_IN_CDB: SenseTriple = SenseTriple(0x5, 0x24, 0x0);
+const MEDIUM_ERROR: u8 = 0x3;
+const ILLEGAL_REQUEST: u8 = 0x5;
+
+pub const INVALID_COMMAND_OPERATION_CODE: SenseTriple = SenseTriple(ILLEGAL_REQUEST, 0x20, 0x0);
+pub const LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE: SenseTriple = SenseTriple(ILLEGAL_REQUEST, 0x21, 0x0);
+pub const INVALID_FIELD_IN_CDB: SenseTriple = SenseTriple(ILLEGAL_REQUEST, 0x24, 0x0);
+
+pub const UNRECOVERED_READ_ERROR: SenseTriple = SenseTriple(MEDIUM_ERROR, 0x11, 0x0);

@@ -10,6 +10,7 @@
 
 use std::convert::{TryFrom, TryInto};
 
+use log::warn;
 use num_enum::TryFromPrimitive;
 
 use crate::scsi::mode_page::ModePage;
@@ -371,8 +372,6 @@ pub enum ReportSupportedOpCodesMode {
 }
 
 impl Cdb {
-    // TODO: figure out what we're supposed to do for too-short CDBs and
-    // start doing that
     // TODO: do we want to ensure reserved fields are 0? SCSI allows, but
     // doesn't require, us to do so.
     // See comment in mod.rs - I don't think we gain anything splitting this
@@ -427,7 +426,10 @@ impl Cdb {
                     (0x8, 0x0) => ModePageSelection::Single(ModePage::Caching),
                     (0x3f, 0x0) => ModePageSelection::AllPageZeros,
                     _ => {
-                        dbg!(page_code, subpage_code);
+                        warn!(
+                            "Rejecting request for unknown mode page {:#2x}/{:#2x}.",
+                            page_code, subpage_code
+                        );
                         return Err(ParseError::InvalidField);
                     }
                 };
