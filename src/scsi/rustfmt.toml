@@ -2,4 +2,3 @@ imports_granularity = "Crate"
 group_imports = "StdExternalCrate"
 wrap_comments = true
 normalize_comments = true
-doc-valid-idents = ["iSCSI"]

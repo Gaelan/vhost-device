@@ -60,6 +60,7 @@ pub enum CmdError {
     DataIn(io::Error),
 }
 
+#[allow(clippy::doc_markdown)]
 /// A transport-independent implementation of a SCSI target.
 ///
 /// Currently, we only support emulated targets (see the `emulation` module),

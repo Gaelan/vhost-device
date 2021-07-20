@@ -244,12 +244,12 @@ pub enum ParseOpcodeResult {
 /// service action vs an invalid opcode.
 ///
 /// To allow for this, we have a two-step parsing API. First, a caller
-/// calls parse_opcode with the first byte of the CDB. This could return
+/// calls `parse_opcode` with the first byte of the CDB. This could return
 /// three things:
 /// - `Command`: the opcode corresponded to a single-byte command; we're done.
 /// - `Invalid`: the opcode isn't recognized at all; we're done.
 /// - `ServiceAction`: the opcode is the first byte of a service action; the
-///   caller needs to call .parse() on the UnparsedServiceAction we returned
+///   caller needs to call .parse() on the `UnparsedServiceAction` we returned
 ///   with the service action byte.
 pub fn parse_opcode(opcode: u8) -> ParseOpcodeResult {
     let found = OPCODES.iter().find(|(_, (x, _))| *x == opcode);

@@ -1,3 +1,5 @@
+//! Helpers for virtio and virtio-scsi.
+
 use std::{
     cell::Cell,
     cmp::{max, min},
@@ -201,7 +203,6 @@ pub struct DescriptorChainReader<M: GuestAddressSpace + Clone> {
     iter: DescriptorChainRwIter<M>,
     current: Option<Descriptor>,
     offset: u32,
-    // read: u32,
 }
 
 impl<M: GuestAddressSpace + Clone> DescriptorChainReader<M> {
