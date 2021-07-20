@@ -1,0 +1,22 @@
+[package]
+name = "vhost-user-scsi"
+version = "0.1.0"
+authors = ["Gaelan Steele <gbs@canishe.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# TOOD: merge vhost-user-backend#18
+vhost-user-backend = { git = "https://github.com/slp/vhost-user-backend", branch = "various_vring_fixes" }
+epoll = "4.3.1"
+vm-memory = "0.5.0"
+vhost = { git = "https://github.com/rust-vmm/vhost" }
+virtio-bindings = "0.1.0"
+env_logger = "0.8.3"
+num_enum = "0.5.1"
+virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio" }
+vmm-sys-util = "0.8.0"
+structopt = "0.3"
+log = "0.4.14"
+
