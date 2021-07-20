@@ -6,11 +6,10 @@ use std::{
     path::Path,
 };
 
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use CmdError::DataIn;
 
-use super::{CmdError, EmulatedTarget};
-use crate::scsi::{
+use super::{
     command::{
         parse_opcode, Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl,
         ParseError, ParseOpcodeResult, ReportLunsSelectReport, ReportSupportedOpCodesMode,
@@ -18,8 +17,9 @@ use crate::scsi::{
     },
     mode_page::ModePage,
     response_data::{respond_report_luns, respond_standard_inquiry_data},
-    sense, CmdOutput, DeviceType, LogicalUnit, Request, SilentlyTruncate, TaskAttr,
+    CmdError, CmdOutput, EmulatedTarget, LogicalUnit, Request,
 };
+use crate::scsi::{emulation::response_data::SilentlyTruncate, sense, DeviceType, TaskAttr};
 
 pub struct BlockDevice {
     file: File,
@@ -118,7 +118,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
             return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
         }
 
-        let mut data_in = SilentlyTruncate(
+        let mut data_in = SilentlyTruncate::new(
             req.data_in,
             cdb.allocation_length.map_or(usize::MAX, |x| x as usize),
         );
@@ -525,7 +525,6 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 Ok(CmdOutput::ok())
             }
             Command::RequestSense(format) => {
-                dbg!(format);
                 match format {
                     SenseFormat::Fixed => {
                         data_in

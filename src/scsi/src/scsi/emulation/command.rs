@@ -13,7 +13,7 @@ use std::convert::{TryFrom, TryInto};
 use log::warn;
 use num_enum::TryFromPrimitive;
 
-use crate::scsi::mode_page::ModePage;
+use crate::scsi::emulation::mode_page::ModePage;
 
 /// One of the modes supported by SCSI's REPORT LUNS command.
 #[derive(PartialEq, Eq, TryFromPrimitive, Debug, Copy, Clone)]
@@ -414,6 +414,11 @@ impl Cdb {
         // Shrink the cdb down to its size, so accidentally accessing fields past the
         // length panics
         let cdb = &cdb[..ct.cdb_template().len()];
+
+        // unwraps below are safe: they're just calling TryFrom to convert from slices
+        // to fixed-size arrays; in each case, we're using constant indexes and we
+        // verified above that they're in bounds, so none of them can panic at runtime
+
         match ct {
             CommandType::Inquiry => {
                 // INQUIRY

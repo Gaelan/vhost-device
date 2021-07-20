@@ -4,7 +4,8 @@ use std::{io::ErrorKind, path::Path};
 
 use super::do_command_fail;
 use crate::scsi::{
-    block_device::BlockDevice, sense, CmdError, EmulatedTarget, Request, Target, TaskAttr,
+    emulation::{block_device::BlockDevice, EmulatedTarget},
+    sense, CmdError, Request, Target, TaskAttr,
 };
 
 #[test]

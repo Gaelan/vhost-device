@@ -1,6 +1,38 @@
 //! Some helpers for writing response data, shared between `BlockDevice` and
 //! `MissingLun`
 
+use std::cmp::min;
+
+/// A wrapper around a `Write` that silently truncates its input after a given
+/// number of bytes. This matches the semantics of SCSI's ALLOCATION LENGTH
+/// field; anything beyond the allocation length is silently omitted.
+pub struct SilentlyTruncate<W: Write>(W, usize);
+
+impl<W: Write> SilentlyTruncate<W> {
+    pub fn new(writer: W, len: usize) -> Self {
+        Self(writer, len)
+    }
+}
+
+impl<W: Write> Write for SilentlyTruncate<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.1 == 0 {
+            // our goal is to silently fail, so once we've stopped actually
+            // writing, just pretend all writes work
+            return Ok(buf.len());
+        }
+        let len = min(buf.len(), self.1);
+        let buf = &buf[..len];
+        let written = self.0.write(buf)?;
+        self.1 -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
 use std::{convert::TryFrom, io, io::Write};
 
 fn encode_lun(lun: u16) -> [u8; 8] {

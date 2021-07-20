@@ -7,7 +7,8 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend" }
+# TOOD: merge vhost-user-backend#18
+vhost-user-backend = { git = "https://github.com/slp/vhost-user-backend", branch = "various_vring_fixes" }
 epoll = "4.3.1"
 vm-memory = "0.5.0"
 vhost = { git = "https://github.com/rust-vmm/vhost" }

@@ -7,9 +7,9 @@ mod report_supported_operation_codes;
 use std::path::Path;
 
 use super::{
-    block_device::BlockDevice,
+    emulation::{block_device::BlockDevice, EmulatedTarget},
     sense::{self, SenseTriple},
-    EmulatedTarget, Request, Target,
+    Request, Target,
 };
 use crate::scsi::CmdOutput;
 

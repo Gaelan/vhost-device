@@ -10,8 +10,6 @@ use log::error;
 use virtio_queue::{Descriptor, DescriptorChain, DescriptorChainRwIter};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 
-use crate::scsi::command::Cdb;
-
 /// virtio-scsi has its own format for LUNs, documented in 5.6.6.1 of virtio
 /// v1.1. This represents a LUN parsed from that format.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -41,20 +39,11 @@ impl VirtioScsiLun {
         }
     }
 }
-#[derive(Debug)]
-pub struct Request {
-    pub lun: VirtioScsiLun,
-    pub id: u64,
-    pub task_attr: u8,
-    pub prio: u8,
-    pub crn: u8,
-    pub cdb: Cdb,
-}
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum VirtioScsiResponse {
+pub enum ResponseCode {
     Ok = 0,
     Overrun = 1,
     Aborted = 2,
@@ -67,21 +56,9 @@ pub enum VirtioScsiResponse {
     Failure = 9,
 }
 
-// #[repr(u8)]
-// pub enum Status {
-//     Good = 0x0,
-//     CheckCondition = 0x2,
-//     ConditionMet = 0x4,
-//     Busy = 0x8,
-//     ReservationConflict = 0x18,
-//     TaskSetFull = 0x28,
-//     AcaActive = 0x30,
-//     TaskAborted = 0x40,
-// }
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Response {
-    pub response: VirtioScsiResponse,
+    pub response: ResponseCode,
     pub status: u8,
     pub status_qualifier: u16,
     pub sense: Vec<u8>,
@@ -99,6 +76,19 @@ impl Response {
         writer.write_all(&self.sense[..])?;
 
         Ok(())
+    }
+
+    /// Shortcut to create a response for an error condition, where most fields
+    /// don't matter.
+    pub fn error(code: ResponseCode, residual: u32) -> Self {
+        assert!(code != ResponseCode::Ok);
+        Self {
+            response: code,
+            status: 0,
+            status_qualifier: 0,
+            sense: Vec::new(),
+            residual,
+        }
     }
 }
 
@@ -170,7 +160,7 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(current) = self.current {
             let left_in_descriptor = current.len() - self.offset;
-            let to_write: u32 = min(left_in_descriptor, buf.len() as u32);
+            let to_write: u32 = min(left_in_descriptor as usize, buf.len()) as u32;
 
             let written = self
                 .chain

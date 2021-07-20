@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use super::{do_command_fail, do_command_in};
-use crate::scsi::{block_device::BlockDevice, sense, EmulatedTarget};
+use crate::scsi::{
+    emulation::{block_device::BlockDevice, EmulatedTarget},
+    sense,
+};
 
 #[test]
 fn test_all() {
