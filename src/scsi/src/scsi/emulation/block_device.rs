@@ -19,7 +19,7 @@ use super::{
     response_data::{respond_report_luns, respond_standard_inquiry_data},
     CmdError, CmdOutput, EmulatedTarget, LogicalUnit, Request,
 };
-use crate::scsi::{emulation::response_data::SilentlyTruncate, sense, DeviceType, TaskAttr};
+use crate::scsi::{emulation::response_data::SilentlyTruncate, sense, TaskAttr};
 
 pub struct BlockDevice {
     file: File,
@@ -245,7 +245,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 for page in pages {
                     match pc {
                         ModeSensePageControl::Current | ModeSensePageControl::Default => {
-                            page.write(&mut data_in);
+                            page.write(&mut data_in).map_err(DataIn)?;
                         }
                         ModeSensePageControl::Changeable => {
                             // SPC-6 6.14.3: "If the logical unit does not
@@ -338,10 +338,9 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 }
             }
             Command::Inquiry(page_code) => {
-                // top bits 0: peripheral device code = exists and ready
-                data_in
-                    .write_all(&[DeviceType::DirectAccessBlock as u8])
-                    .map_err(DataIn)?;
+                // top 3 bits 0: peripheral device code = exists and ready
+                // bottom 5 bits 0: device type = block device
+                data_in.write_all(&[0]).map_err(DataIn)?;
 
                 if let Some(code) = page_code {
                     let mut out = vec![];

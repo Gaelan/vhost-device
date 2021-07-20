@@ -98,6 +98,8 @@ pub enum VirtioScsiError {
 // ScsiError(ScsiError)
 }
 
+/// A `Write` implementation that writes to the memory indicated by a virtio
+/// descriptor chain.
 #[derive(Clone)]
 pub struct DescriptorChainWriter<M: GuestAddressSpace + Clone> {
     chain: DescriptorChain<M>,
@@ -192,6 +194,8 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     }
 }
 
+/// A `Read` implementation that reads from the memory indicated by a virtio
+/// descriptor chain.
 pub struct DescriptorChainReader<M: GuestAddressSpace + Clone> {
     chain: DescriptorChain<M>,
     iter: DescriptorChainRwIter<M>,

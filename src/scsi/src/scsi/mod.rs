@@ -38,22 +38,6 @@ impl CmdOutput {
     }
 }
 
-#[repr(u8)] // actually 5 bits
-#[allow(dead_code)]
-enum DeviceType {
-    DirectAccessBlock = 0x0,
-    SequentialAccess = 0x1,
-    Processor = 0x3,
-    CdDvd = 0x5,
-    OpticalMemory = 0x7,
-    MediaChanger = 0x8,
-    StorageArrayController = 0xc,
-    EnclosureServices = 0xd,
-    SimplifiedDirectAccess = 0xe,
-    OpticalCardReaderWriter = 0xf,
-    ObjectBasedStorage = 0x11,
-}
-
 pub struct Request<'a, W: Write, R: Read> {
     pub id: u64,
     pub cdb: &'a [u8],
@@ -62,10 +46,6 @@ pub struct Request<'a, W: Write, R: Read> {
     pub data_out: &'a mut R,
     pub crn: u8,
     pub prio: u8,
-}
-
-pub trait Target<W: Write, R: Read>: Send + Sync {
-    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> Result<CmdOutput, CmdError>;
 }
 
 /// An transport-level error encountered while processing a SCSI command.
@@ -78,4 +58,13 @@ pub enum CmdError {
     CdbTooShort,
     /// An error occurred while writing to the provided data in writer.
     DataIn(io::Error),
+}
+
+/// A transport-independent implementation of a SCSI target.
+///
+/// Currently, we only support emulated targets (see the `emulation` module),
+/// but other implementations of this trait could implement pass-through to
+/// iSCSI targets or SCSI devices on the host.
+pub trait Target<W: Write, R: Read>: Send + Sync {
+    fn execute_command(&self, lun: u16, req: Request<'_, W, R>) -> Result<CmdOutput, CmdError>;
 }

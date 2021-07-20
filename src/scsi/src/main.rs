@@ -307,10 +307,9 @@ impl VhostUserBackend for VhostUserScsiBackend {
 struct Opt {
     /// Make the images read-only.
     ///
-    /// Currently, we don't actually support writes, but this is still useful:
-    /// if we tell Linux the disk is write-protected, some tools using the SCSI
-    /// generic API won't work. But if we don't, it'll try to write to the disk
-    /// on mount, and fail.
+    /// Currently, we don't actually support writes, but sometimes we want to
+    /// pretend the disk is writable to work around issues with some tools that
+    /// use the Linux SCSI generic API.
     #[structopt(long("read-only"), short("r"))]
     read_only: bool,
     /// Tell the guest this disk is non-rotational.
@@ -337,6 +336,10 @@ fn main() {
         // This is fairly simple to add; it's just a matter of supporting the right LUN
         // encoding formats.
         exit(1);
+    }
+
+    if !opt.read_only {
+        warn!("Currently, only read-only images are supported. Unless you know what you're doing, you want to pass -r");
     }
 
     for image in opt.images {
