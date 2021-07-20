@@ -22,6 +22,9 @@ pub enum ReportLunsSelectReport {
     NoWellKnown = 0x0,
     WellKnownOnly = 0x1,
     All = 0x2,
+    Administrative = 0x10,
+    TopLevel = 0x11,
+    SameConglomerate = 0x12,
 }
 
 /// A type of "vital product data" page returned by SCSI's INQUIRY command.
@@ -134,7 +137,13 @@ impl From<VpdPage> for u8 {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SenseFormat {
+    Fixed,
+    Descriptor,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ModePageSelection {
     AllPageZeros,
     Single(ModePage),
@@ -142,43 +151,54 @@ pub enum ModePageSelection {
 
 #[derive(Debug)]
 pub enum Command {
-    TestUnitReady,
-    ReportLuns(ReportLunsSelectReport),
-    ReadCapacity10,
-    ReadCapacity16,
+    Inquiry(Option<VpdPage>),
     ModeSense6 {
         pc: ModeSensePageControl,
         mode_page: ModePageSelection,
+        /// Disable block descriptors
         dbd: bool,
     },
     Read10 {
+        /// Disable page out (i.e. hint that this page won't be accessed again
+        /// soon, so we shouldn't bother caching it)
         dpo: bool,
+        /// Force unit access (i.e. bypass cache)
         fua: bool,
         lba: u32,
+        /// Group number, used for serveral SCSI features we don't implement
+        /// (such as tagging commands from different workloads for performance
+        /// monitoring purposes)
         group_number: u8,
         transfer_length: u16,
     },
-    Inquiry(Option<VpdPage>),
+    ReadCapacity10,
+    ReadCapacity16,
     ReportSupportedOperationCodes {
+        /// SCSI RCTD bit: whether we should include timeout descriptors.
         rctd: bool,
         mode: ReportSupportedOpCodesMode,
     },
+    RequestSense(SenseFormat),
+    ReportLuns(ReportLunsSelectReport),
+    TestUnitReady,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum CommandType {
-    TestUnitReady,
     Inquiry,
     ModeSense6,
-    ReadCapacity10,
     Read10,
+    ReadCapacity10,
     ReadCapacity16,
     ReportLuns,
     ReportSupportedOperationCodes,
+    RequestSense,
+    TestUnitReady,
 }
 
 pub const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
     (CommandType::TestUnitReady, (0x0, None)),
+    (CommandType::RequestSense, (0x3, None)),
     (CommandType::Inquiry, (0x12, None)),
     (CommandType::ModeSense6, (0x1a, None)),
     (CommandType::ReadCapacity10, (0x25, None)),
@@ -244,6 +264,7 @@ impl CommandType {
     /// Basically, this consists of a structure the size of the CDB for the
     /// command, starting with the opcode and service action (if any), then
     /// proceeding to a bitmap of fields we recognize.
+    #[allow(clippy::too_many_lines)] // no sense in splitting this up
     pub const fn cdb_template(self) -> &'static [u8] {
         match self {
             CommandType::TestUnitReady => &[
@@ -252,6 +273,14 @@ impl CommandType {
                 0b0000_0000,
                 0b0000_0000,
                 0b0000_0000,
+                0b0000_0100,
+            ],
+            CommandType::RequestSense => &[
+                0x3,
+                0b0000_0001,
+                0b0000_0000,
+                0b0000_0000,
+                0b1111_1111,
                 0b0000_0100,
             ],
             CommandType::ReportLuns => &[
@@ -376,30 +405,25 @@ impl Cdb {
     // doesn't require, us to do so.
     // See comment in mod.rs - I don't think we gain anything splitting this
     // into functions
-    #[allow(clippy::clippy::too_many_lines)]
-    pub fn parse(buf: &[u8]) -> Result<Self, ParseError> {
-        let ct = CommandType::from_cdb(buf)?;
-        if buf.len() < ct.cdb_template().len() {
+    #[allow(clippy::too_many_lines)]
+    pub fn parse(cdb: &[u8]) -> Result<Self, ParseError> {
+        let ct = CommandType::from_cdb(cdb)?;
+        if cdb.len() < ct.cdb_template().len() {
             return Err(ParseError::TooSmall);
         }
+        // Shrink the cdb down to its size, so accidentally accessing fields past the
+        // length panics
+        let cdb = &cdb[..ct.cdb_template().len()];
         match ct {
-            CommandType::TestUnitReady => {
-                // TEST UNIT READY
-                Ok(Self {
-                    command: Command::TestUnitReady,
-                    allocation_length: None,
-                    naca: (buf[5] & 0b0000_0100) != 0,
-                })
-            }
             CommandType::Inquiry => {
                 // INQUIRY
-                let evpd = match buf[1] {
+                let evpd = match cdb[1] {
                     0 => false,
                     1 => true,
                     // obselete or reserved bits set
                     _ => return Err(ParseError::InvalidField),
                 };
-                let page_code_raw = buf[2];
+                let page_code_raw = cdb[2];
                 let page_code = match (evpd, page_code_raw) {
                     (false, 0) => None,
                     (true, pc) => Some(pc.try_into().map_err(|_| ParseError::InvalidField)?),
@@ -408,20 +432,20 @@ impl Cdb {
                 Ok(Self {
                     command: Command::Inquiry(page_code),
                     allocation_length: Some(u32::from(u16::from_be_bytes(
-                        buf[3..5].try_into().unwrap(),
+                        cdb[3..5].try_into().unwrap(),
                     ))),
-                    naca: (buf[5] & 0b0000_0100) != 0,
+                    naca: (cdb[5] & 0b0000_0100) != 0,
                 })
             }
             CommandType::ModeSense6 => {
-                let dbd = match buf[1] {
+                let dbd = match cdb[1] {
                     0b0000_1000 => true,
                     0b0000_0000 => false,
                     _ => return Err(ParseError::InvalidField),
                 };
-                let pc = (buf[2] & 0b1100_0000) >> 6;
-                let page_code = buf[2] & 0b0011_1111;
-                let subpage_code = buf[3];
+                let pc = (cdb[2] & 0b1100_0000) >> 6;
+                let page_code = cdb[2] & 0b0011_1111;
+                let subpage_code = cdb[3];
                 let mode: ModePageSelection = match (page_code, subpage_code) {
                     (0x8, 0x0) => ModePageSelection::Single(ModePage::Caching),
                     (0x3f, 0x0) => ModePageSelection::AllPageZeros,
@@ -439,12 +463,12 @@ impl Cdb {
                         mode_page: mode,
                         dbd,
                     },
-                    allocation_length: Some(u32::from(buf[4])),
-                    naca: (buf[5] & 0b0000_0100) != 0,
+                    allocation_length: Some(u32::from(cdb[4])),
+                    naca: (cdb[5] & 0b0000_0100) != 0,
                 })
             }
             CommandType::Read10 => {
-                if buf[1] & 0b1110_0100 != 0 {
+                if cdb[1] & 0b1110_0100 != 0 {
                     // Features (protection and rebuild assist) we don't
                     // support; the standard says to respond with INVALID
                     // FIELD IN CDB for these if unsupported
@@ -452,57 +476,72 @@ impl Cdb {
                 }
                 Ok(Self {
                     command: Command::Read10 {
-                        dpo: buf[1] & 0b0001_0000 != 0,
-                        fua: buf[1] & 0b0000_1000 != 0,
-                        lba: u32::from_be_bytes(buf[2..6].try_into().unwrap()),
-                        group_number: buf[6] & 0b0011_1111,
-                        transfer_length: u16::from_be_bytes(buf[7..9].try_into().unwrap()),
+                        dpo: cdb[1] & 0b0001_0000 != 0,
+                        fua: cdb[1] & 0b0000_1000 != 0,
+                        lba: u32::from_be_bytes(cdb[2..6].try_into().unwrap()),
+                        group_number: cdb[6] & 0b0011_1111,
+                        transfer_length: u16::from_be_bytes(cdb[7..9].try_into().unwrap()),
                     },
                     allocation_length: None,
-                    naca: (buf[9] & 0b0000_0100) != 0,
+                    naca: (cdb[9] & 0b0000_0100) != 0,
                 })
             }
             CommandType::ReadCapacity10 => Ok(Self {
                 command: Command::ReadCapacity10,
                 allocation_length: None,
-                naca: (buf[9] & 0b0000_0100) != 0,
+                naca: (cdb[9] & 0b0000_0100) != 0,
             }),
             CommandType::ReadCapacity16 => Ok(Self {
                 command: Command::ReadCapacity16,
-                allocation_length: Some(u32::from_be_bytes(buf[10..14].try_into().unwrap())),
-                naca: (buf[15] & 0b0000_0100) != 0,
+                allocation_length: Some(u32::from_be_bytes(cdb[10..14].try_into().unwrap())),
+                naca: (cdb[15] & 0b0000_0100) != 0,
             }),
             CommandType::ReportLuns => Ok(Self {
                 command: Command::ReportLuns(
-                    buf[2].try_into().map_err(|_| ParseError::InvalidField)?,
+                    cdb[2].try_into().map_err(|_| ParseError::InvalidField)?,
                 ),
-                allocation_length: Some(u32::from_be_bytes(buf[6..10].try_into().unwrap())),
-                naca: (buf[9] & 0b0000_0100) != 0,
+                allocation_length: Some(u32::from_be_bytes(cdb[6..10].try_into().unwrap())),
+                naca: (cdb[9] & 0b0000_0100) != 0,
             }),
             CommandType::ReportSupportedOperationCodes => {
-                // REPORT SUPPORTED OPERATION CODES
-                let rctd = buf[2] & 0b1000_0000 != 0;
-                let mode = match buf[2] & 0b0000_0111 {
+                let rctd = cdb[2] & 0b1000_0000 != 0;
+                let mode = match cdb[2] & 0b0000_0111 {
                     0b000 => ReportSupportedOpCodesMode::All,
-                    0b001 => ReportSupportedOpCodesMode::OneCommand(buf[3]),
+                    0b001 => ReportSupportedOpCodesMode::OneCommand(cdb[3]),
                     0b010 => ReportSupportedOpCodesMode::OneServiceAction(
-                        buf[3],
-                        u16::from_be_bytes(buf[4..6].try_into().unwrap()),
+                        cdb[3],
+                        u16::from_be_bytes(cdb[4..6].try_into().unwrap()),
                     ),
                     0b011 => ReportSupportedOpCodesMode::OneCommandOrServiceAction(
-                        buf[3],
-                        u16::from_be_bytes(buf[4..6].try_into().unwrap()),
+                        cdb[3],
+                        u16::from_be_bytes(cdb[4..6].try_into().unwrap()),
                     ),
                     _ => return Err(ParseError::InvalidField),
                 };
 
                 Ok(Self {
                     command: Command::ReportSupportedOperationCodes { rctd, mode },
-                    allocation_length: Some(u32::from_be_bytes(buf[6..10].try_into().unwrap())),
-
-                    naca: (buf[11] & 0b0000_0100) != 0,
+                    allocation_length: Some(u32::from_be_bytes(cdb[6..10].try_into().unwrap())),
+                    naca: (cdb[11] & 0b0000_0100) != 0,
                 })
             }
+            CommandType::RequestSense => {
+                let format = if cdb[1] & 0b0000_0001 == 1 {
+                    SenseFormat::Descriptor
+                } else {
+                    SenseFormat::Fixed
+                };
+                Ok(Self {
+                    command: Command::RequestSense(format),
+                    allocation_length: Some(u32::from(cdb[4])),
+                    naca: (cdb[5] & 0b0000_0100) != 0,
+                })
+            }
+            CommandType::TestUnitReady => Ok(Self {
+                command: Command::TestUnitReady,
+                allocation_length: None,
+                naca: (cdb[5] & 0b0000_0100) != 0,
+            }),
         }
     }
 }

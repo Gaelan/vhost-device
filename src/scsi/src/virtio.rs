@@ -6,10 +6,11 @@ use std::{
     rc::Rc,
 };
 
+use log::error;
 use virtio_queue::{Descriptor, DescriptorChain, DescriptorChainRwIter};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 
-use crate::{hope, scsi::command::Cdb};
+use crate::scsi::command::Cdb;
 
 /// virtio-scsi has its own format for LUNs, documented in 5.6.6.1 of virtio
 /// v1.1. This represents a LUN parsed from that format.
@@ -26,7 +27,13 @@ impl VirtioScsiLun {
         } else if bytes[0] == 0x1 {
             let target = bytes[1];
             // bytes[2..3] is a normal SCSI single-level lun
-            hope!((bytes[2] & 0b0100_0000) != 0); // todo
+            if (bytes[2] & 0b0100_0000) == 0 {
+                error!(
+                    "Got LUN in unsupported format: {:#2x} {:#2x}",
+                    bytes[2], bytes[3]
+                );
+                return None;
+            }
             let lun = u16::from_be_bytes([bytes[2] & 0b0011_1111, bytes[3]]);
             Some(Self::TargetLun(target, lun))
         } else {
@@ -190,7 +197,8 @@ impl<M: GuestAddressSpace + Clone> Write for DescriptorChainWriter<M> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        todo!()
+        // no-op: we're writing directly to guest memory
+        Ok(())
     }
 }
 

@@ -22,9 +22,10 @@ fn test_all() {
             0, // control
         ],
         &[
-            0, 0, 0, 64, // command data length: 8*8 = 64
+            0, 0, 0, 72, // command data length: 9*8 = 72
             // OC, res, SA (u16), res, flags, cdb len
             0x0, 0, 0, 0, 0, 0, 0, 6, // TEST UNIT READY
+            0x3, 0, 0, 0, 0, 0, 0, 6, // REQUEST SENSE
             0x12, 0, 0, 0, 0, 0, 0, 6, // INQUIRY
             0x1a, 0, 0, 0, 0, 0, 0, 6, // MODE SENSE (6)
             0x25, 0, 0, 0, 0, 0, 0, 10, // READ CAPACITY(10)
@@ -55,9 +56,11 @@ fn test_all_timeouts() {
             0, // control
         ],
         &[
-            0, 0, 0, 160, // command data length: 8 * 20 = 160
+            0, 0, 0, 180, // command data length: 9 * 20 = 180
             // OC, res, SA (u16), res, flags, cdb len (u16)
             0x0, 0, 0, 0, 0, 0b10, 0, 6, // TEST UNIT READY
+            0, 0xa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // no timeouts
+            0x3, 0, 0, 0, 0, 0b10, 0, 6, // REQUEST SENSE
             0, 0xa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // no timeouts
             0x12, 0, 0, 0, 0, 0b10, 0, 6, // INQUIRY
             0, 0xa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // no timeouts

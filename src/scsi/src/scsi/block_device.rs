@@ -6,21 +6,19 @@ use std::{
     path::Path,
 };
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use CmdError::DataIn;
 
 use super::{CmdError, EmulatedTarget};
-use crate::{
-    hope,
-    scsi::{
-        command::{
-            parse_opcode, Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl,
-            ParseError, ParseOpcodeResult, ReportLunsSelectReport, ReportSupportedOpCodesMode,
-            VpdPage, OPCODES,
-        },
-        mode_page::ModePage,
-        sense, CmdOutput, DeviceType, LogicalUnit, Request, SilentlyTruncate, TaskAttr,
+use crate::scsi::{
+    command::{
+        parse_opcode, Cdb, Command, CommandType, ModePageSelection, ModeSensePageControl,
+        ParseError, ParseOpcodeResult, ReportLunsSelectReport, ReportSupportedOpCodesMode,
+        SenseFormat, VpdPage, OPCODES,
     },
+    mode_page::ModePage,
+    response_data::{respond_report_luns, respond_standard_inquiry_data},
+    sense, CmdOutput, DeviceType, LogicalUnit, Request, SilentlyTruncate, TaskAttr,
 };
 
 pub struct BlockDevice {
@@ -85,7 +83,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
         if req.crn != 0 {
             // CRN is a weird bit of the protocol we wouldn't ever expect to be used over
             // virtio-scsi; but it's allowed to set it non-zero
-            warn!("Recieved non-zero CRN: {}", req.crn)
+            warn!("Recieved non-zero CRN: {}", req.crn);
         }
         if req.task_attr != TaskAttr::Simple {
             // virtio-scsi spec allows us to treat all task attrs as SIMPLE.
@@ -110,12 +108,15 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
             Err(ParseError::InvalidField) => {
                 return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB))
             }
-            Err(ParseError::TooSmall) => {
-                panic!("")
-            }
+            Err(ParseError::TooSmall) => return Err(CmdError::CdbTooShort),
         };
 
-        hope!(!cdb.naca);
+        if cdb.naca {
+            // We don't support NACA, and say as much in our INQUIRY data, so if
+            // we get it that's an error.
+            warn!("Driver set NACA bit, which is unsupported.");
+            return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
+        }
 
         let mut data_in = SilentlyTruncate(
             req.data_in,
@@ -127,24 +128,13 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
         match cdb.command {
             Command::TestUnitReady => Ok(CmdOutput::ok()),
             Command::ReportLuns(select_report) => {
-                fn encode_lun(lun: u16) -> [u8; 8] {
-                    // TODO: Support LUNs over 256
-                    assert!(lun < 256);
-                    [0, lun.try_into().unwrap(), 0, 0, 0, 0, 0, 0]
+                if select_report != ReportLunsSelectReport::NoWellKnown {
+                    // TODO: Are any of the other modes worth supporting?
+                    warn!("Rejecting unsupported REPORT LUNS mode {:?}", select_report);
+                    return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
                 }
-                let luns = target.luns().map(encode_lun);
 
-                hope!(select_report == ReportLunsSelectReport::NoWellKnown);
-
-                // TODO: unwrap is safe-ish: luns.len() should never be over 2^16. We don't
-                // actually have a proper check for that yet, though.
-                data_in
-                    .write_all(&(u32::try_from(luns.len() * 8)).unwrap().to_be_bytes())
-                    .map_err(DataIn)?;
-                data_in.write_all(&[0; 4]).map_err(DataIn)?; // reserved
-                for lun in luns {
-                    data_in.write_all(&lun).map_err(DataIn)?;
-                }
+                respond_report_luns(&mut data_in, target.luns()).map_err(DataIn)?;
 
                 Ok(CmdOutput::ok())
             }
@@ -209,9 +199,6 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 }
             }
             Command::ModeSense6 { mode_page, pc, dbd } => {
-                hope!(pc == ModeSensePageControl::Current);
-                hope!(!dbd);
-
                 // we use this for the pages array if we only need a single element; lifetime
                 // rules mean it has to be declared here
                 let single_page_array: [ModePage; 1];
@@ -249,11 +236,34 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     ])
                     .map_err(DataIn)?;
 
-                // TODO: Block descriptors are optional, so we currently don't provide them.
-                // Does any driver actually use them?
+                if !dbd {
+                    // TODO: Block descriptors are optional, so we currently
+                    // don't provide them. Does any driver
+                    // actually use them?
+                }
 
                 for page in pages {
-                    page.write(&mut data_in);
+                    match pc {
+                        ModeSensePageControl::Current | ModeSensePageControl::Default => {
+                            page.write(&mut data_in);
+                        }
+                        ModeSensePageControl::Changeable => {
+                            // SPC-6 6.14.3: "If the logical unit does not
+                            // implement changeable parameters mode pages and
+                            // the device server receives a MODE SENSE command
+                            // with 01b in the PC field, then the device server
+                            // shall terminate the command with CHECK CONDITION
+                            // status, with the sense key set to ILLEGAL
+                            // REQUEST, and the additional sense code set to
+                            // INVALID FIELD IN CDB."
+                            return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
+                        }
+                        ModeSensePageControl::Saved => {
+                            return Ok(CmdOutput::check_condition(
+                                sense::SAVING_PARAMETERS_NOT_SUPPORTED,
+                            ))
+                        }
+                    }
                 }
 
                 Ok(CmdOutput::ok())
@@ -262,13 +272,13 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                 dpo,
                 fua,
                 lba,
-                group_number,
+                group_number: _,
                 transfer_length,
             } => {
                 if dpo {
                     // DPO is just a hint that the guest probably won't access
                     // this any time soon, so we can ignore it
-                    warn!("Silently ignoring DPO flag")
+                    debug!("Silently ignoring DPO flag");
                 }
                 if fua {
                     // Somewhat weirdly, SCSI supports FUA on reads. Here's the
@@ -296,7 +306,9 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         error!("Error syncing file: {}", e);
                     }
                 }
-                hope!(group_number == 0);
+
+                // Ignore group number: AFAICT, it's for separating reads from different
+                // workloads in performance metrics, and we don't report anything like that
 
                 let size = match self.size_in_blocks() {
                     Ok(size) => size,
@@ -367,42 +379,7 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         .map_err(DataIn)?;
                     data_in.write_all(&out).map_err(DataIn)?;
                 } else {
-                    data_in
-                        .write_all(&[
-                            0,   /* various bits: not removable, not part of a conglomerate, no
-                                  * info on hotpluggability */
-                            0x7, // version: SPC-6
-                            0b0011_0000 | 0x2, /* bits: support NormACA, modern LUN format;
-                                  * INQUIRY data version 2 */
-                            91,          // additional INQURIY data length
-                            0,           // don't support various things
-                            0,           // more things we don't have
-                            0b0000_0010, // support command queueing
-                        ])
-                        .map_err(DataIn)?;
-
-                    // TODO: register this or another name with T10
-                    data_in.write_all(b"rust-vmm").map_err(DataIn)?;
-                    data_in.write_all(b"vhost-user-scsi ").map_err(DataIn)?;
-                    data_in.write_all(b"v0  ").map_err(DataIn)?;
-
-                    // The Linux kernel doesn't request any more than this, so any data we return
-                    // after this point is mostly academic.
-
-                    data_in.write_all(&[0; 22]).map_err(DataIn)?;
-
-                    let product_descs: &[u16; 8] = &[
-                        0xc0,   // SAM-6 (no version claimed)
-                        0x05c0, // SPC-5 (no version claimed)
-                        0x0600, // SBC-4 (no version claimed)
-                        0x0, 0x0, 0x0, 0x0, 0x0,
-                    ];
-
-                    for desc in product_descs {
-                        data_in.write_all(&desc.to_be_bytes()).map_err(DataIn)?;
-                    }
-
-                    data_in.write_all(&[0; 22]).map_err(DataIn)?;
+                    respond_standard_inquiry_data(&mut data_in).map_err(DataIn)?;
                 }
 
                 Ok(CmdOutput::ok())
@@ -546,6 +523,21 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                     }
                 }
                 Ok(CmdOutput::ok())
+            }
+            Command::RequestSense(format) => {
+                dbg!(format);
+                match format {
+                    SenseFormat::Fixed => {
+                        data_in
+                            .write_all(&sense::NO_ADDITIONAL_SENSE_INFORMATION.to_fixed_sense())
+                            .map_err(DataIn)?;
+                        Ok(CmdOutput::ok())
+                    }
+                    SenseFormat::Descriptor => {
+                        // Don't support desciptor format.
+                        Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB))
+                    }
+                }
             }
         }
     }

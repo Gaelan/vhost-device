@@ -4,15 +4,12 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::non_ascii_literal)]
-mod virtio;
-#[macro_use]
-mod utils;
-// mod mem_utils;
 mod scsi;
+mod virtio;
 
 use std::{
     convert::TryInto,
-    io::{ErrorKind, Read},
+    io::{self, ErrorKind, Read},
     path::PathBuf,
     process::exit,
     sync::{Arc, RwLock},
@@ -20,9 +17,12 @@ use std::{
 
 use log::{debug, error, info, warn};
 use structopt::StructOpt;
-use vhost::vhost_user::{
-    message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
-    Listener,
+use vhost::{
+    vhost_user,
+    vhost_user::{
+        message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures},
+        Listener,
+    },
 };
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon};
 use virtio::VirtioScsiLun;
@@ -89,14 +89,19 @@ impl VhostUserScsiBackend {
             1 => TaskAttr::Ordered,
             2 => TaskAttr::HeadOfQueue,
             3 => TaskAttr::Aca,
-            _ => todo!(),
+            _ => {
+                // virtio-scsi spec allows us to map any task attr to simple, presumably
+                // including future ones
+                warn!("Unknown task attr: {}", buf[16]);
+                TaskAttr::Simple
+            }
         };
         let prio = buf[17];
         let crn = buf[18];
         let cdb = &buf[19..(19 + CDB_SIZE)];
 
         let mut body_writer = writer.clone();
-        body_writer.skip(108); // header + 96 (default sense size)
+        body_writer.skip(12 + SENSE_SIZE as u32); // response header is 12 bytes long
 
         let response = if let Some((target, lun)) = self.parse_target(lun) {
             let output = target.execute_command(
@@ -199,7 +204,7 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
     fn set_event_idx(&mut self, enabled: bool) {
         // Should always be true until we support EVENT_IDX in features.
-        assert!(!enabled)
+        assert!(!enabled);
     }
 
     fn update_memory(
@@ -217,12 +222,12 @@ impl VhostUserBackend for VhostUserScsiBackend {
         evset: epoll::Events,
         vrings: &[Arc<RwLock<vhost_user_backend::Vring>>],
         thread_id: usize,
-    ) -> std::result::Result<bool, std::io::Error> {
-        hope!(evset == epoll::Events::EPOLLIN); // TODO: virtiofsd returns an error on this
-        hope!(vrings.len() == 3);
-        hope!(thread_id == 0);
+    ) -> io::Result<bool> {
+        assert!(evset == epoll::Events::EPOLLIN);
+        assert!(vrings.len() == 3);
+        assert!((device_event as usize) < vrings.len());
+        assert!(thread_id == 0);
 
-        hope!((device_event as usize) < vrings.len());
         // unwrap: only fails if the lock is poisoned, in which case we already panicked
         // somewhere else
         let mut vring = vrings[device_event as usize].write().unwrap();
@@ -231,7 +236,6 @@ impl VhostUserBackend for VhostUserScsiBackend {
         let chains: Vec<_> = queue.iter().unwrap().collect();
 
         for dc in chains {
-            dbg!(device_event, dc.clone().collect::<Vec<_>>());
             let mut writer = DescriptorChainWriter::new(dc.clone());
             let mut reader = DescriptorChainReader::new(dc.clone());
 
@@ -246,7 +250,7 @@ impl VhostUserBackend for VhostUserScsiBackend {
 
             queue
                 .add_used(dc.head_index(), writer.max_written())
-                .unwrap()
+                .unwrap();
         }
 
         vring.signal_used_queue().unwrap();
@@ -317,14 +321,37 @@ fn main() {
 
     backend.add_target(Box::new(target));
 
-    let mut daemon = VhostUserDaemon::new("vhost-user-scsi".into(), Arc::new(RwLock::new(backend)))
+    let backend = Arc::new(RwLock::new(backend));
+
+    let mut daemon = VhostUserDaemon::new("vhost-user-scsi".into(), Arc::clone(&backend))
         .expect("Creating daemon");
 
     daemon
         .start(Listener::new(opt.sock, true).expect("Creating listener"))
         .expect("Starting daemon");
 
-    daemon.wait().expect("Running daemon");
+    let run_result = daemon.wait();
+
+    match run_result {
+        Ok(()) => {
+            info!("Stopping cleanly.");
+        }
+        Err(vhost_user_backend::Error::HandleRequest(vhost_user::Error::PartialMessage)) => {
+            info!("vhost-user connection closed with partial message. If the VM is shutting down, this is expected behavior; otherwise, it might be a bug.");
+        }
+        Err(e) => {
+            error!("Error running daemon: {:?}", e);
+        }
+    }
+
+    // No matter the result, we need to shut down the worker thread.
+    // unwrap will only panic if we already panicked somewhere else
+    backend
+        .read()
+        .unwrap()
+        .exit_event
+        .write(1)
+        .expect("Shutting down worker thread");
 
     dbg!();
 }

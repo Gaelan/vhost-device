@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+mod bad_lun;
 mod generic;
 mod report_supported_operation_codes;
 
@@ -12,12 +13,17 @@ use super::{
 };
 use crate::scsi::CmdOutput;
 
-fn do_command_in(target: &mut EmulatedTarget<Vec<u8>, &[u8]>, cdb: &[u8], expected_data_in: &[u8]) {
+fn do_command_in_lun(
+    target: &mut EmulatedTarget<Vec<u8>, &[u8]>,
+    lun: u16,
+    cdb: &[u8],
+    expected_data_in: &[u8],
+) {
     let mut data_in = Vec::new();
     let mut data_out: &[u8] = &[];
 
     let res = target.execute_command(
-        0,
+        lun,
         Request {
             id: 0,
             cdb,
@@ -33,8 +39,9 @@ fn do_command_in(target: &mut EmulatedTarget<Vec<u8>, &[u8]>, cdb: &[u8], expect
     assert_eq!(&data_in, expected_data_in);
 }
 
-fn do_command_fail(
+fn do_command_fail_lun(
     target: &mut EmulatedTarget<Vec<u8>, &[u8]>,
+    lun: u16,
     cdb: &[u8],
     expected_error: SenseTriple,
 ) {
@@ -42,7 +49,7 @@ fn do_command_fail(
     let mut data_out: &[u8] = &[];
 
     let res = target.execute_command(
-        0,
+        lun,
         Request {
             id: 0,
             cdb,
@@ -56,6 +63,18 @@ fn do_command_fail(
 
     assert_eq!(res.unwrap(), CmdOutput::check_condition(expected_error));
     assert_eq!(&data_in, &[]);
+}
+
+fn do_command_in(target: &mut EmulatedTarget<Vec<u8>, &[u8]>, cdb: &[u8], expected_data_in: &[u8]) {
+    do_command_in_lun(target, 0, cdb, expected_data_in);
+}
+
+fn do_command_fail(
+    target: &mut EmulatedTarget<Vec<u8>, &[u8]>,
+    cdb: &[u8],
+    expected_error: SenseTriple,
+) {
+    do_command_fail_lun(target, 0, cdb, expected_error);
 }
 
 #[test]
@@ -242,5 +261,91 @@ fn test_read_capacity_16() {
             0,    // LBA 0 is aligned (top bits above)
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // reserved
         ],
+    );
+}
+
+#[test]
+fn test_inquiry() {
+    let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(Path::new("/dev/null")).unwrap();
+    target.add_lun(Box::new(dev));
+
+    do_command_in(
+        &mut target,
+        &[
+            0x12, // INQUIRY
+            0,    // EVPD bit: 0
+            0,    // page code
+            1, 0, // alloc length: 256
+            0, // control
+        ],
+        // some empty comments to get rustfmt to do something vaguely sensible
+        &[
+            0,    // accessible; direct acccess block device
+            0,    // features
+            0x7,  // version
+            0x12, // response data format v2, HiSup = 1
+            91,   // addl length
+            0, 0, 0, // unsupported features
+            // vendor
+            b'r', b'u', b's', b't', b'-', b'v', b'm', b'm', //
+            // product
+            b'v', b'h', b'o', b's', b't', b'-', b'u', b's', b'e', b'r', b'-', b's', b'c', b's',
+            b'i', b' ', //
+            // revision
+            b'v', b'0', b' ', b' ', //
+            // reserved/obselete/vendor specific
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            // version descriptors
+            0x0, 0xc0, // SAM-6
+            0x05, 0xc0, // SPC-5 (no code assigned for 6 yet)
+            0x06, 0, // SBC-4
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            // reserved
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+}
+
+#[test]
+fn test_request_sense() {
+    let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(Path::new("/dev/null")).unwrap();
+    target.add_lun(Box::new(dev));
+
+    do_command_in(
+        &mut target,
+        &[
+            0x3, // INQUIRY
+            0,   // desc bit: 0
+            0, 0,   // reserved
+            255, // alloc length
+            0,   // control
+        ],
+        // We'll always return this - modern SCSI has autosense, so any errors are sent with the
+        // response to the command that caused them (and therefore immediately cleared), and
+        // REQUEST SENSE returns an actual error only under some exceptional circumstances
+        // we don't implement.
+        &sense::NO_ADDITIONAL_SENSE_INFORMATION.to_fixed_sense(),
+    );
+}
+
+#[test]
+fn test_request_sense_descriptor_format() {
+    let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(Path::new("/dev/null")).unwrap();
+    target.add_lun(Box::new(dev));
+
+    do_command_fail(
+        &mut target,
+        &[
+            0x3, // INQUIRY
+            1,   // desc bit: 1
+            0, 0,   // reserved
+            255, // alloc length
+            0,   // control
+        ],
+        // We don't support descriptor format sense data.
+        sense::INVALID_FIELD_IN_CDB,
     );
 }

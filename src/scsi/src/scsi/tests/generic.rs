@@ -1,9 +1,10 @@
+//! Tests for stuff shared between commands.
+
 use std::{io::ErrorKind, path::Path};
 
 use super::do_command_fail;
 use crate::scsi::{
-    block_device::BlockDevice, sense, CmdError, CmdOutput, EmulatedTarget, Request, Target,
-    TaskAttr,
+    block_device::BlockDevice, sense, CmdError, EmulatedTarget, Request, Target, TaskAttr,
 };
 
 #[test]
@@ -39,6 +40,7 @@ fn test_invalid_service_action() {
     );
 }
 
+#[test]
 fn test_short_data_out_buffer() {
     let mut target: EmulatedTarget<&mut [u8], &[u8]> = EmulatedTarget::new();
     let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
@@ -68,8 +70,35 @@ fn test_short_data_out_buffer() {
     );
 
     if let CmdError::DataIn(e) = res.unwrap_err() {
-        assert_eq!(e.kind(), ErrorKind::WriteZero)
+        assert_eq!(e.kind(), ErrorKind::WriteZero);
     } else {
         panic!();
     }
+}
+
+#[test]
+fn test_short_cdb() {
+    let mut target: EmulatedTarget<&mut [u8], &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(Path::new("src/scsi/tests/test.img")).unwrap();
+    target.add_lun(Box::new(dev));
+
+    let mut data_in: &mut [u8] = &mut [];
+    let mut data_out: &[u8] = &[];
+
+    let res = target.execute_command(
+        0,
+        Request {
+            id: 0,
+            cdb: &[
+                0x28, // READ (10)
+            ],
+            task_attr: TaskAttr::Simple,
+            data_in: &mut data_in,
+            data_out: &mut data_out,
+            crn: 0,
+            prio: 0,
+        },
+    );
+
+    assert!(matches!(res.unwrap_err(), CmdError::CdbTooShort));
 }
