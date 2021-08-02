@@ -180,7 +180,28 @@ pub enum Command {
     },
     RequestSense(SenseFormat),
     ReportLuns(ReportLunsSelectReport),
+    SynchronizeCache10 {
+        /// If true (and supported), return success immediately without waiting
+        /// for sync to complete.
+        immed: bool,
+        lba: u32,
+        group_number: u8,
+        num_logical_blocks: u16,
+    },
     TestUnitReady,
+    Write10 {
+        /// Disable page out (i.e. hint that this page won't be accessed again
+        /// soon, so we shouldn't bother caching it)
+        dpo: bool,
+        /// Force unit access (i.e. bypass cache)
+        fua: bool,
+        lba: u32,
+        /// Group number, used for serveral SCSI features we don't implement
+        /// (such as tagging commands from different workloads for performance
+        /// monitoring purposes)
+        group_number: u8,
+        transfer_length: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -193,7 +214,9 @@ pub enum CommandType {
     ReportLuns,
     ReportSupportedOperationCodes,
     RequestSense,
+    SynchronizeCache10,
     TestUnitReady,
+    Write10,
 }
 
 pub const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
@@ -203,6 +226,8 @@ pub const OPCODES: &[(CommandType, (u8, Option<u16>))] = &[
     (CommandType::ModeSense6, (0x1a, None)),
     (CommandType::ReadCapacity10, (0x25, None)),
     (CommandType::Read10, (0x28, None)),
+    (CommandType::Write10, (0x2a, None)),
+    (CommandType::SynchronizeCache10, (0x35, None)),
     (CommandType::ReadCapacity16, (0x9e, Some(0x10))),
     (CommandType::ReportLuns, (0xa0, None)),
     (
@@ -356,7 +381,19 @@ impl CommandType {
             ],
             CommandType::Read10 => &[
                 0x28,
-                0b1111_1100,
+                0b0001_1100,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b0011_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b0000_0100,
+            ],
+            CommandType::SynchronizeCache10 => &[
+                0x35,
+                0b0000_0010,
                 0b1111_1111,
                 0b1111_1111,
                 0b1111_1111,
@@ -386,6 +423,18 @@ impl CommandType {
                 0b1111_1111,
                 0b1111_1111,
                 0b0000_0000,
+                0b0000_0100,
+            ],
+            CommandType::Write10 => &[
+                0x28,
+                0b0001_1000,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b1111_1111,
+                0b0011_1111,
+                0b1111_1111,
+                0b1111_1111,
                 0b0000_0100,
             ],
         }
@@ -561,11 +610,39 @@ impl Cdb {
                     naca: (cdb[5] & 0b0000_0100) != 0,
                 })
             }
+            CommandType::SynchronizeCache10 => Ok(Self {
+                command: Command::SynchronizeCache10 {
+                    immed: cdb[1] & 0b0000_0010 != 0,
+                    lba: u32::from_be_bytes(cdb[2..6].try_into().unwrap()),
+                    group_number: cdb[6] & 0b0011_1111,
+                    num_logical_blocks: u16::from_be_bytes(cdb[7..9].try_into().unwrap()),
+                },
+                allocation_length: None,
+                naca: (cdb[9] & 0b0000_0100) != 0,
+            }),
             CommandType::TestUnitReady => Ok(Self {
                 command: Command::TestUnitReady,
                 allocation_length: None,
                 naca: (cdb[5] & 0b0000_0100) != 0,
             }),
+            CommandType::Write10 => {
+                if cdb[1] & 0b1110_0000 != 0 {
+                    // Protection, which we don't support; the standard says
+                    // to respond with INVALID FIELD IN CDB if unsupported
+                    return Err(ParseError::InvalidField);
+                }
+                Ok(Self {
+                    command: Command::Write10 {
+                        dpo: cdb[1] & 0b0001_0000 != 0,
+                        fua: cdb[1] & 0b0000_1000 != 0,
+                        lba: u32::from_be_bytes(cdb[2..6].try_into().unwrap()),
+                        group_number: cdb[6] & 0b0011_1111,
+                        transfer_length: u16::from_be_bytes(cdb[7..9].try_into().unwrap()),
+                    },
+                    allocation_length: None,
+                    naca: (cdb[9] & 0b0000_0100) != 0,
+                })
+            }
         }
     }
 }

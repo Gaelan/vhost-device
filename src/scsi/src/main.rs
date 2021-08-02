@@ -4,13 +4,15 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::non_ascii_literal)]
+#![allow(clippy::unnested_or_patterns)] // remove once Rust 1.53 has been out for a bit
 mod scsi;
 mod virtio;
 
 use std::{
     convert::TryInto,
-    fs::File,
+    fs::OpenOptions,
     io::{self, ErrorKind, Read},
+    os::unix::prelude::OpenOptionsExt,
     path::PathBuf,
     process::exit,
     sync::{Arc, RwLock},
@@ -168,14 +170,14 @@ impl VhostUserScsiBackend {
                     // way the guest can set it too small
                     unreachable!();
                 }
-                Err(CmdError::DataIn(e)) => {
+                Err(CmdError::DataIn(e)) | Err(CmdError::DataOut(e)) => {
                     if e.kind() == ErrorKind::WriteZero {
                         Response::error(ResponseCode::Overrun, 0)
                     } else {
-                        error!("Error writing response to guest memory: {}", e);
+                        error!("Error accessing guest memory: {}", e);
 
-                        // There's some chance the header and data in are on different descriptors,
-                        // and only the data in descriptor is bad, so let's at least try to write an
+                        // There's some chance the header and data are on different descriptors,
+                        // and only the data descriptor is bad, so let's at least try to write an
                         // error to the header
                         Response::error(ResponseCode::Failure, body_writer.residual())
                     }
@@ -344,7 +346,14 @@ fn main() {
     }
 
     for image in opt.images {
-        let mut dev = BlockDevice::new(File::open(image).expect("Opening image"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!opt.read_only)
+            // TODO: consider writeback caching
+            .custom_flags(libc::O_DSYNC)
+            .open(image)
+            .expect("Opening image");
+        let mut dev = BlockDevice::new(file);
         dev.set_write_protected(opt.read_only);
         dev.set_solid_state(opt.solid_state);
         target.add_lun(Box::new(dev));

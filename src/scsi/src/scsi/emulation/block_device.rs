@@ -3,10 +3,11 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::unix::prelude::*,
+    thread,
 };
 
 use log::{debug, error, warn};
-use CmdError::DataIn;
+use CmdError::{DataIn, DataOut};
 
 use super::{
     command::{
@@ -363,8 +364,8 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         }
                         VpdPage::LogicalBlockProvisioning => {
                             out.push(0); // don't support threshold sets
-                            out.push(0b1110_0100); // support unmapping w/ UNMAP
-                                                   // and WRITE SAME (10 & 16),
+                            out.push(0b0000_0100); // don't support unmapping
+                                                   // (by any mechanism)
                                                    // don't support anchored
                                                    // LBAs or group descriptors
                             out.push(0b0000_0010); // thin provisioned
@@ -537,6 +538,85 @@ impl<W: Write, R: Read> LogicalUnit<W, R> for BlockDevice {
                         Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB))
                     }
                 }
+            }
+            Command::SynchronizeCache10 {
+                immed,
+                lba,
+                group_number: _,
+                num_logical_blocks,
+            } => {
+                if lba != 0 || num_logical_blocks != 0 {
+                    // We could use sync_file_range() here, but it looks like there's some nuance
+                    // to handling that right. But I'm not sure Linux ever does anything but a full
+                    // sync, and in any case, syncing everything is correct if not performant.
+                    warn!("Threating partial sync as full sync.");
+                }
+
+                if immed {
+                    error!("Rejecting sync command with immed bit set.");
+                    // spec says to return invalid field if we don't support immed
+                    return Ok(CmdOutput::check_condition(sense::INVALID_FIELD_IN_CDB));
+                }
+
+                match self.file.sync_all() {
+                    Ok(()) => Ok(CmdOutput::ok()),
+                    Err(e) => {
+                        error!("Error syncing image: {}", e);
+                        Ok(CmdOutput::check_condition(sense::WRITE_ERROR))
+                    }
+                }
+            }
+            Command::Write10 {
+                dpo,
+                fua,
+                lba,
+                group_number: _,
+                transfer_length,
+            } => {
+                if dpo {
+                    // See comment for read
+                    warn!("Silently ignoring DPO flag");
+                }
+
+                let size = match self.size_in_blocks() {
+                    Ok(size) => size,
+                    Err(e) => {
+                        error!("Error getting image size for write: {}", e);
+                        return Ok(CmdOutput::check_condition(sense::WRITE_ERROR));
+                    }
+                };
+
+                if u64::from(lba) + u64::from(transfer_length) > size {
+                    return Ok(CmdOutput::check_condition(
+                        sense::LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
+                    ));
+                }
+
+                // block_size is a u32, so converting it to usize is safe -
+                // this will never run with a 16-bit usize
+                let len = usize::from(transfer_length) * (self.block_size() as usize);
+                let mut buf: Vec<u8> = vec![0; len];
+
+                req.data_out.read_exact(&mut buf[..]).map_err(DataOut)?;
+
+                let write_result = self
+                    .file
+                    .write_all_at(&buf[..], u64::from(lba) * u64::from(self.block_size()));
+
+                if let Err(e) = write_result {
+                    // TODO: Handle errors from writeback caching
+                    error!("Error writing to image: {}", e);
+                    return Ok(CmdOutput::check_condition(sense::WRITE_ERROR));
+                }
+
+                if fua {
+                    if let Err(e) = self.file.sync_all() {
+                        error!("Error syncing after FUA write: {}", e);
+                        return Ok(CmdOutput::check_condition(sense::WRITE_ERROR));
+                    }
+                }
+
+                Ok(CmdOutput::ok())
             }
         }
     }

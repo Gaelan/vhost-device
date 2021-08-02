@@ -19,6 +19,7 @@ virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio" }
 vmm-sys-util = "0.8.0"
 structopt = "0.3"
 log = "0.4.14"
+libc = "0.2.98"
 
 [dev-dependencies]
 tempfile = "3.2.0"

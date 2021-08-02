@@ -58,6 +58,8 @@ pub enum CmdError {
     CdbTooShort,
     /// An error occurred while writing to the provided data in writer.
     DataIn(io::Error),
+    /// An error occurred while reading from the provided data out reader.
+    DataOut(io::Error),
 }
 
 #[allow(clippy::doc_markdown)]

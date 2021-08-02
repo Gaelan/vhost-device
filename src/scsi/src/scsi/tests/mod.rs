@@ -50,6 +50,32 @@ fn do_command_in_lun(
     assert_eq!(&data_in, expected_data_in);
 }
 
+fn do_command_out_lun<'a>(
+    target: &mut EmulatedTarget<Vec<u8>, &'a [u8]>,
+    lun: u16,
+    cdb: &[u8],
+    data_out: &'a [u8],
+) {
+    let mut data_in = Vec::new();
+    let mut data_out = data_out;
+
+    let res = target.execute_command(
+        lun,
+        Request {
+            id: 0,
+            cdb,
+            task_attr: super::TaskAttr::Simple,
+            data_in: &mut data_in,
+            data_out: &mut data_out,
+            crn: 0,
+            prio: 0,
+        },
+    );
+
+    assert_eq!(res.unwrap(), CmdOutput::ok());
+    assert_eq!(&data_in, &[]);
+}
+
 fn do_command_fail_lun(
     target: &mut EmulatedTarget<Vec<u8>, &[u8]>,
     lun: u16,
@@ -78,6 +104,14 @@ fn do_command_fail_lun(
 
 fn do_command_in(target: &mut EmulatedTarget<Vec<u8>, &[u8]>, cdb: &[u8], expected_data_in: &[u8]) {
     do_command_in_lun(target, 0, cdb, expected_data_in);
+}
+
+fn do_command_out<'a>(
+    target: &mut EmulatedTarget<Vec<u8>, &'a [u8]>,
+    cdb: &[u8],
+    data_out: &'a [u8],
+) {
+    do_command_out_lun(target, 0, cdb, data_out);
 }
 
 fn do_command_fail(
@@ -358,5 +392,38 @@ fn test_request_sense_descriptor_format() {
         ],
         // We don't support descriptor format sense data.
         sense::INVALID_FIELD_IN_CDB,
+    );
+}
+
+#[test]
+fn test_write_10() {
+    let mut target: EmulatedTarget<Vec<u8>, &[u8]> = EmulatedTarget::new();
+    let dev = BlockDevice::new(test_image());
+    target.add_lun(Box::new(dev));
+
+    do_command_out(
+        &mut target,
+        &[
+            0x2a, // WRITE (10)
+            0,    // protect, dpo, fua
+            0, 0, 0, 1, // LBA: 1
+            0, // group number
+            0, 1, // transfer length
+            0, // control
+        ],
+        &[b'z'; 512],
+    );
+
+    do_command_in(
+        &mut target,
+        &[
+            0x28, // READ (10)
+            0,    // flags
+            0, 0, 0, 1, // LBA: 1
+            0, // reserved, group #
+            0, 1, // transfer length: 1
+            0, // control
+        ],
+        &[b'z'; 512],
     );
 }

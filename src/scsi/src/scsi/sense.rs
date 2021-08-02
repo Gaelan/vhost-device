@@ -13,7 +13,7 @@ impl SenseTriple {
             self.1, // asc
             self.2, // ascq
             0x0,    // field-replacable unit code
-            0x0, 0x0, 0x0, // sense-key-sepcific information
+            0x0, 0x0, 0x0, // sense-key-specific information
         ]
     }
 }
@@ -31,3 +31,4 @@ pub const LOGICAL_UNIT_NOT_SUPPORTED: SenseTriple = SenseTriple(ILLEGAL_REQUEST,
 pub const SAVING_PARAMETERS_NOT_SUPPORTED: SenseTriple = SenseTriple(ILLEGAL_REQUEST, 0x39, 0x0);
 
 pub const UNRECOVERED_READ_ERROR: SenseTriple = SenseTriple(MEDIUM_ERROR, 0x11, 0x0);
+pub const WRITE_ERROR: SenseTriple = SenseTriple(MEDIUM_ERROR, 0x0c, 0x0);
